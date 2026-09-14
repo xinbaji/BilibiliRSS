@@ -1,0 +1,28 @@
+# OS
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Editor
+.idea/
+.vscode/*
+!.vscode/extensions.json
+
+# Logs
+*.log
+npm-debug.log*
+
+# Dependencies (reserved for future build tooling)
+node_modules/
+
+# Build output (reserved for future modular build)
+/dist/
+/build/
+
+# Local secrets
+.env
+.env.local
+
+# 本地预览文件
+preview.html
