@@ -3,10 +3,10 @@
 > 让 B 站自动帮你「收视频、追番、盯数据、下视频」的浏览器脚本 —— 数据全部存在你自己电脑上。
 
 ![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)
-![Version](https://img.shields.io/badge/version-0.3.0-pink.svg)
+![Version](https://img.shields.io/badge/version-0.3.1-pink.svg)
 ![Platform](https://img.shields.io/badge/需要-Tampermonkey-00485c.svg)
 
-打开 B 站任意视频页或 UP 主页，屏幕右下角会出现一颗粉色悬浮球，点开就是一个小面板：**订阅追更、稍后再看、下载视频、数据监控**，四件事一站搞定。所有数据只保存在你的浏览器里，不需要注册任何账号，也不上传任何东西。
+打开 B 站任意视频页或 UP 主页，屏幕右下角会出现一颗粉色悬浮球，点开就是一个小面板：**订阅追更、稍后再看、下载视频、数据监控**，四件事一站搞定。所有数据只保存在你的浏览器里。
 
 ![工作台：番剧页一键订阅与下载](images/workbench-bangumi.png)
 
@@ -30,7 +30,7 @@
 ## 安装（只需三步）
 
 1. **给浏览器装上 Tampermonkey 扩展**
-   打开 [tampermonkey.net](https://www.tampermonkey.net/)，按照页面提示安装。Chrome、Edge、Firefox 都支持。
+   打开 [tampermonkey.net](https://www.tampermonkey.net/)，按照页面提示安装。或通过Chrome/Edge的扩展商店搜索 篡改猴 安装扩展。Chrome、Edge、Firefox 都支持。
 
 2. **安装 BilibiliRSS 脚本**
    点这个链接，Tampermonkey 会自动弹出安装窗口，点「安装」即可：

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BilibiliRSS
 // @namespace    https://github.com/xinbaji/BilibiliRSS
-// @version      0.3.0
+// @version      0.3.1
 // @description  B站稍后再看 · UP/合集/视频订阅追更 · 增量监控 · 下载(直链+DASH ffmpeg合并mp4)+弹幕XML（独立油猴版）
 // @author       xinbaji
 // @match        https://www.bilibili.com/*
@@ -130,7 +130,7 @@ function md5(str) {
 /* ============================ 存储 ============================ */
 const NS = 'BilibiliRSS';
 const DEFAULTS = {
-  ver: '0.3.0',
+  ver: '0.3.1',
   settings: {
     notify: true, backfill: 10, dlQn: 127, dlDanmu: true,
     /* v0.3.1 下载形态开关 */
@@ -373,15 +373,33 @@ let arcQuietUntil = 0;
 const arcBlocked = () => Date.now() < arcQuietUntil;
 const arcMarkQuiet = () => { arcQuietUntil = Date.now() + 60 * 1000; };
 
+/* UP 空间两个接口的时长字段都是 "mm:ss"/"h:mm:ss" 字符串(arc/search 的 vlist.length
+ * 与 ajax 的 list.length), 而 view/season 接口给的是秒数 —— 统一在此归一化为秒。
+ * v0.3.0 及之前直接把 "5:30" 喂给 fmtTime(Number("5:30")=NaN) → 稍后再看显示 00:00。 */
+const parseLen = (s) => {
+  if (typeof s === 'number') return s > 0 ? Math.round(s) : 0;
+  const m = String(s || '').trim().match(/^(?:(\d+):)?(\d{1,2}):(\d{2})$/);
+  return m ? (Number(m[1]) || 0) * 3600 + Number(m[2]) * 60 + Number(m[3]) : (Number(s) || 0);
+};
 /* 空间投稿归一化(arc/search vlist 与 ajax list 字段近似) */
 function mapUpVideo(v) {
   return {
     bvid: v.bvid, aid: v.aid, title: v.title, pic: https(v.pic), author: v.author || '',
-    mid: v.mid, length: v.length || v.duration || 0, created: v.created || v.pubdate || 0, stat: {
+    mid: v.mid, length: parseLen(v.length) || parseLen(v.duration) || 0, created: v.created || v.pubdate || 0, stat: {
       play: v.play || v.video_review || 0, view: v.video_review || v.play || 0,
       favorite: v.favorites || 0, danmaku: v.comment || v.danmaku || 0, share: 0
     }
   };
+}
+/* 自愈: 修复 v0.3.0 误存为 "00:00" 的存量 UP 条目 —— 用本次拉到的真实时长回填 */
+function repairUpDurations(vlist) {
+  if (!vlist || !vlist.length) return 0;
+  const lenMap = new Map(vlist.map(v => [KEY(v.bvid, 0), v.length]));
+  let n = 0;
+  for (const it of store.items) {
+    if (it && it.dur === '00:00' && lenMap.has(it.key)) { it.dur = fmtTime(lenMap.get(it.key)); n++; }
+  }
+  return n;
 }
 const upSpaceUrl = mid => 'https://space.bilibili.com/' + mid;
 /* 兜底: 旧版空间 ajax 投稿接口(原生支持 keyword 服务端过滤)。arc/search 被 412/风控时可救急。 */
@@ -688,15 +706,17 @@ async function upFullMatches(sub) {
 async function refreshUp(sub, opt = {}) {
   const ks = new Set([...dedupeSet, ...(store.ignore || [])]);
   let items = [];
+  let vlist = [];
   const kws = (sub.kws || []).filter(Boolean);
   if (kws.length) {
     /* 全历史搜索(订阅/手动) 或 轻量单页最新 50 条(日常自动刷新) */
-    const vlist = opt.full ? await upFullMatches(sub) : await fetchUpVideos(sub.mid, 50);
+    vlist = opt.full ? await upFullMatches(sub) : await fetchUpVideos(sub.mid, 50);
     items = itemsFromUpVideos(vlist, sub.id, sub.kws || [], sub.exkws || [], ks);
   } else {
-    const vlist = await fetchUpVideos(sub.mid, Math.max(50, getSet().backfill || 10));
+    vlist = await fetchUpVideos(sub.mid, Math.max(50, getSet().backfill || 10));
     items = itemsFromUpVideos(vlist, sub.id, sub.kws || [], sub.exkws || [], ks);
   }
+  repairUpDurations(vlist);
   store.items.unshift(...items);
   if (items.length) save();
   rebuildDedupe();
@@ -902,10 +922,12 @@ async function addSubscription(input, kws = [], opt = {}) {
             st: 'todo', added: Date.now()
           };
         }).filter(Boolean).slice(0, Math.max(back, 5));
+        repairUpDurations(merged);
         store.items.unshift(...its); added = its.length;
       } else {
         const vlist = await fetchUpVideos(sub.mid, Math.max(back, 10));
         const its = itemsFromUpVideos(vlist.slice(0, back), sub.id, sub.kws || [], sub.exkws || [], ks);
+        repairUpDurations(vlist);
         store.items.unshift(...its); added = its.length;
       }
     } else if (sub.type === 'season') {
@@ -3764,7 +3786,8 @@ function detectPagePick() {
   }
   /* ---------- 合集页 ---------- */
   if (/^\/\d+\/channel\/collectiondetail/.test(path) || /^\/\d+\/lists/.test(path)) {
-    const mid = path.slice(1, path.indexOf('/', 1));
+    /* 分支条件已保证第二个斜杠存在, 但统一用正则取, 防将来入口变化时踩同款坑 */
+    const mid = (path.match(/^\/(\d+)/) || [])[1] || '';
     const sid = new URLSearchParams(location.search).get('sid');
     if (!mid || !sid) return Promise.reject(new Error('no sid'));
     const loadAll = async () => {
@@ -3797,7 +3820,9 @@ function detectPagePick() {
   }
   /* ---------- UP 空间页 ---------- */
   if (/^\/(\d+)(?:\/|$)/.test(path)) {
-    const mid = path.slice(1, path.indexOf('/', 1));
+    /* 用正则取 mid, 不能用 slice(1, indexOf('/',1)): URL 无尾斜杠时 indexOf=-1,
+     * slice(1,-1) 会把 mid 末位数字削掉 → 订阅/监控到错误的 UP (v0.3.0 真 bug) */
+    const mid = (path.match(/^\/(\d+)/) || [])[1] || '';
     if (!/^\d+$/.test(mid)) return Promise.reject(new Error('no mid'));
     return fetchUpInfo(mid).then(info => {
       if (!info) throw new Error('fetch fail');
