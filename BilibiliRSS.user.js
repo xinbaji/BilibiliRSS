@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BilibiliRSS
 // @namespace    https://github.com/xinbaji/BilibiliRSS
-// @version      0.3.1
+// @version      0.3.2
 // @description  B站稍后再看 · UP/合集/视频订阅追更 · 增量监控 · 下载(直链+DASH ffmpeg合并mp4)+弹幕XML（独立油猴版）
 // @author       xinbaji
 // @match        https://www.bilibili.com/*
@@ -54,6 +54,22 @@ const fmtTime = (sec) => {
   const h = Math.floor(sec / 3600), m = Math.floor(sec % 3600 / 60), s = sec % 60;
   return (h ? h + ':' : '') + String(m).padStart(2, '0') + ':' + String(s).padStart(2, '0');
 };
+/* 下载报错压成一句短话放 toast(完整原文仍存任务 err 字段, 下载页可见) */
+function shortErr(e) {
+  let m = String((e && (e.message || e.error || e)) || e || '未知错误').replace(/\s+/g, ' ').trim();
+  const rules = [
+    [/net::ERR_(\w+)/i, r => '网络错误 ' + r[1].toLowerCase().replace(/_/g, ' ')],
+    [/HTTP (\d{3})/i, r => 'HTTP ' + r[1]],
+    [/GM_download/i, () => '下载已取消或通道超时'],
+    [/GM_xmlhttpRequest/i, () => '下载通道错误'],
+    [/Failed to fetch|NetworkError|Load failed/i, () => '网络连接失败'],
+    [/超时|timeout/i, () => '网络超时'],
+    [/网络错误|分块失败/, () => '网络错误'],
+    [/引擎加载失败|ffmpeg/i, () => '下载引擎加载失败(可改用 ≤720P)']
+  ];
+  for (const [re, fn] of rules) { const r = m.match(re); if (r) return fn(r); }
+  return m.length > 60 ? m.slice(0, 57) + '…' : m;
+}
 const fmtDate = ts => {
   const d = new Date(Number(ts) * 1000), now = Date.now(), diff = (now - d.getTime()) / 1000;
   if (diff < 60) return '刚刚';
@@ -130,7 +146,7 @@ function md5(str) {
 /* ============================ 存储 ============================ */
 const NS = 'BilibiliRSS';
 const DEFAULTS = {
-  ver: '0.3.1',
+  ver: '0.3.2',
   settings: {
     notify: true, backfill: 10, dlQn: 127, dlDanmu: true,
     /* v0.3.1 下载形态开关 */
@@ -1655,7 +1671,7 @@ async function dlTick() {
           'User-Agent': navigator.userAgent
         },
         onload: () => { next.prog = 1; next.st = 'done'; next.doneAt = Date.now(); save(); updateAllUI(); toast('下载完成: ' + next.path); dlTick(); afterDownloaded(next); },
-        onerror: (err) => { next.st = 'err'; next.err = String(err?.error || err?.message || err || '未知错误'); save(); updateAllUI(); toast('下载失败: ' + next.err); dlTick(); },
+        onerror: (err) => { next.st = 'err'; next.err = String(err?.error || err?.message || err || '未知错误'); save(); updateAllUI(); toast('下载失败: ' + shortErr(next.err)); dlTick(); },
         ontimeout: () => { next.st = 'err'; next.err = 'timeout'; save(); updateAllUI(); dlTick(); }
       });
       return;
@@ -1732,12 +1748,12 @@ async function dlTick() {
       afterDownloaded(next);
     } catch (e) {
       next.st = 'err'; next.err = e.message || String(e);
-      save(); updateAllUI(); toast('合并失败: ' + next.err);
+      save(); updateAllUI(); toast('合并失败: ' + shortErr(next.err));
       dlTick();
     }
   } catch (e) {
     next.st = 'err'; next.err = e.message || String(e); save(); updateAllUI();
-    toast('下载失败: ' + next.err);
+    toast('下载失败: ' + shortErr(next.err));
     dlTick();
   }
 }
