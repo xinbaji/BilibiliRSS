@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BilibiliRSS
 // @namespace    https://github.com/xinbaji/BilibiliRSS
-// @version      0.3.2
+// @version      0.3.3
 // @description  B站稍后再看 · UP/合集/视频订阅追更 · 增量监控 · 下载(直链+DASH ffmpeg合并mp4)+弹幕XML（独立油猴版）
 // @author       xinbaji
 // @match        https://www.bilibili.com/*
@@ -146,7 +146,7 @@ function md5(str) {
 /* ============================ 存储 ============================ */
 const NS = 'BilibiliRSS';
 const DEFAULTS = {
-  ver: '0.3.2',
+  ver: '0.3.3',
   settings: {
     notify: true, backfill: 10, dlQn: 127, dlDanmu: true,
     /* v0.3.1 下载形态开关 */
@@ -266,7 +266,7 @@ function gmFetchText(url, referer) {
   return new Promise((resolve, reject) => {
     try {
       GM_xmlhttpRequest({
-        method: 'GET', url, timeout: 20000,
+        method: 'GET', url, timeout: 120000,
         headers: { 'Accept': 'application/json', ...(referer ? { 'Referer': referer } : {}) },
         onload: r => {
           const raw = (r.responseText != null) ? r.responseText
@@ -279,7 +279,7 @@ function gmFetchText(url, referer) {
     } catch (e) { reject(e); }
   });
 }
-async function api(url, params = {}, { needWbi = false, raw = false, retry = 2, transport = '', referer = '', pick = 'data' } = {}) {
+async function api(url, params = {}, { needWbi = false, raw = false, retry = 3, transport = '', referer = '', pick = 'data' } = {}) {
   if (needWbi) { try { await fetchWbiKeys(); params = wbiSign(params); } catch (e) {} }
   const usp = new URLSearchParams();
   Object.entries(params).forEach(([k, v]) => v != null && usp.append(k, String(v)));
@@ -1143,7 +1143,7 @@ const DL_VIDEO_THREADS = 8;
 function gmxRangeLen(url, referer) {
   return new Promise((res) => {
     GM_xmlhttpRequest({
-      method: 'GET', url, responseType: 'arraybuffer', timeout: 20000,
+      method: 'GET', url, responseType: 'arraybuffer', timeout: 120000,
       headers: { Referer: referer || 'https://www.bilibili.com/', 'User-Agent': navigator.userAgent, Range: 'bytes=0-0' },
       onload: r => {
         if (r.status !== 206) return res(0);
@@ -1248,7 +1248,7 @@ async function ffDbPut(key, blob) {
 /* 抓单个文件(带超时); 成功即写缓存 */
 async function ffFetchBlob(url, key) {
   const ctl = new AbortController();
-  const timer = setTimeout(() => ctl.abort(), 30000);
+  const timer = setTimeout(() => ctl.abort(), 120000);
   try {
     const r = await fetch(url, { signal: ctl.signal });
     if (!r.ok) throw new Error('HTTP ' + r.status);
@@ -1544,7 +1544,7 @@ async function resolveBangumiStream(task, wantQn, opt = {}) {
   const ref = bgReferer(task.bgSsid || '', task.epId);
   const reqUrl = (fnval, qn) => api(PGC_PLAYURL,
     { ep_id: task.epId, cid: task.cid, qn, fnval, fnver: 0, fourk: 1, otype: 'json' },
-    { needWbi: true, transport: 'xhr', referer: ref, retry: 1, pick: 'result' });
+    { needWbi: true, transport: 'xhr', referer: ref, retry: 2, pick: 'result' });
 
   /* 仅下载音频 / 音视频分离: 番剧直链同样是混流单文件 → 跳过它, 直接走 DASH */
   if (opt.audioOnly || opt.forceDash) {
@@ -1615,7 +1615,7 @@ async function dlTick() {
   if (doing) return;
   const next = store.dls.find(d => d.st === 'queue');
   if (!next) return;
-  next.st = 'doing'; next.prog = 0.02; next.startedAt = Date.now(); save(); updateAllUI();
+  next.st = 'doing'; next.prog = 0.02; next.startedAt = Date.now(); next.sub = '获取播放地址…'; save(); updateAllUI();
   try {
     let cid = next.cid;
     if (!cid) {
@@ -1630,7 +1630,7 @@ async function dlTick() {
     const plan = next.epId
       ? await resolveBangumiStream(next, set.dlQn || 127, opts)
       : await resolveStream(next.bvid, cid, set.dlQn || 127, opts);
-    next.quality = plan.quality;
+    next.quality = plan.quality; next.planDone = true; next.rPlan = 0;   /* plan 成功: 标记 + 清回队重试计数 */
     /* 文件名随形态变: 仅音频 → .m4a; 其余 → .mp4(分离模式会由基名派生两个文件) */
     const base = sanitizeName(next.title || next.bvid || ('EP' + next.epId));
     next.path = audioOnly ? (base + '.m4a') : (base + '.mp4');
@@ -1752,7 +1752,19 @@ async function dlTick() {
       dlTick();
     }
   } catch (e) {
-    next.st = 'err'; next.err = e.message || String(e); save(); updateAllUI();
+    /* plan 阶段(尚未开始拉分片)失败 → 弱网常见, 自动回队重试至多 3 次;
+     * 业务性错误(大会员/付费/地区/未提供音轨等)不重试直接判死; 开始下载后失败维持判死 */
+    const msg = (e && e.message) || String(e);
+    if (!next.planDone && (next.rPlan || 0) < 3 && !/需大会员|付费|地区限制|缺少 cid|需登录|未提供/.test(msg)) {
+      next.rPlan = (next.rPlan || 0) + 1;
+      next.st = 'queue'; next.prog = 0; next.sub = '网络不佳, 自动重试 ' + next.rPlan + '/3';
+      next.err = msg; save(); updateAllUI();
+      toast('网络不佳, 自动重试 ' + next.rPlan + '/3: ' + shortErr(msg));
+      dlTick();
+      return;
+    }
+    next.rPlan = 0;
+    next.st = 'err'; next.err = msg; save(); updateAllUI();
     toast('下载失败: ' + shortErr(next.err));
     dlTick();
   }
@@ -1761,7 +1773,7 @@ async function dlTick() {
 function gmxText(url) {
   return new Promise((res, rej) => {
     GM_xmlhttpRequest({
-      method: 'GET', url, timeout: 20000,
+      method: 'GET', url, timeout: 120000,
       headers: { Referer: 'https://www.bilibili.com/', 'User-Agent': navigator.userAgent },
       onload: r => { if (r.status >= 200 && r.status < 300) res(r.responseText); else rej(new Error('HTTP ' + r.status)); },
       onerror: () => rej(new Error('网络错误')), ontimeout: () => rej(new Error('超时'))
@@ -3633,7 +3645,7 @@ function renderDl() {
       const w = Math.round(pct * 100) + '%';
       const fill = bar.querySelector('i');
       if (fill && fill.style.width !== w) fill.style.width = w;
-      const opTxt = d.st === 'queue' ? '排队中…' : ((d.sub || '处理中…') + (d.prog ? ' ' + Math.round(pct * 100) + '%' : ''));
+      const opTxt = d.st === 'queue' ? (d.sub || '排队中…') : ((d.sub || '处理中…') + (d.prog ? ' ' + Math.round(pct * 100) + '%' : ''));
       if (op.textContent !== opTxt) op.textContent = opTxt;
     } else {
       if (bar.style.display !== 'none') bar.style.display = 'none';
