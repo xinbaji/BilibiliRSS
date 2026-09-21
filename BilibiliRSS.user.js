@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BilibiliRSS
 // @namespace    https://github.com/xinbaji/BilibiliRSS
-// @version      0.3.4
+// @version      0.3.7
 // @description  B站稍后再看 · UP/合集/视频订阅追更 · 增量监控 · 下载(直链+DASH ffmpeg合并mp4)+弹幕XML（独立油猴版）
 // @author       xinbaji
 // @match        https://www.bilibili.com/*
@@ -146,13 +146,16 @@ function md5(str) {
 /* ============================ 存储 ============================ */
 const NS = 'BilibiliRSS';
 const DEFAULTS = {
-  ver: '0.3.4',
+  ver: '0.3.7',
   settings: {
-    notify: true, backfill: 10, dlQn: 127, dlDanmu: true,
+    notify: true, dlQn: 127, dlDanmu: true,
     /* v0.3.1 下载形态开关 */
     dlCover: false,     /* 附带封面文件: 同目录另存一张封面图 */
     dlSplit: false,     /* 音视频分离: DASH 不合并, 分别存 .video.m4s / .audio.m4s */
-    dlAudioOnly: false  /* 仅下载音频: 只取音轨存为 .m4a */
+    dlAudioOnly: false, /* 仅下载音频: 只取音轨存为 .m4a */
+    /* v0.3.5 */
+    dlThreads: 8,       /* 视频轨并发连接数(2~16, 用户可调) */
+    dlAudioQn: 30280    /* 仅下载音频时的音质档: 30216/30232/30280/30250(杜比)/30251(Hi-Res) */
   },
   subs: [],      // {id,type:'up'|'ugc'|'season',name,face,author?,mid|bvid,sid?,baselineTs?,src,subText,kws:[],exkws:[],on,added}
   items: [],     // {id,key,bvid,pid,cid,title,author,face,pic,dur,pub,ts,subId,stat:[..],st:'todo'|'done'|'ignored',added}
@@ -524,9 +527,50 @@ async function fetchView(bvid) {
   try {
     const d = await api('https://api.bilibili.com/x/web-interface/view', { bvid });
     const pages = (d.pages || []).map(p => ({ cid: p.cid, part: p.part, duration: p.duration }));
+    /* ugc_season: 该视频所属的「合集」(UP 主自己组的) —— 视频页工作台据此识别合集并展示专辑卡 */
+    let ugc = null;
+    if (d.ugc_season && d.ugc_season.id) {
+      const us = d.ugc_season;
+      ugc = { id: String(us.id), title: us.title || '', cover: https(us.cover || ''), mid: us.mid,
+        count: (us.sections || []).reduce((a, s) => a + ((s.episodes || []).length), 0) };
+    }
     return { bvid: d.bvid, aid: d.aid, title: d.title, pic: https(d.pic), author: d.owner?.name,
-      mid: d.owner?.mid, length: d.duration, pubdate: d.pubdate, stat: d.stat, pages };
+      mid: d.owner?.mid, length: d.duration, pubdate: d.pubdate, stat: d.stat, pages, ugc };
   } catch (e) { return null; }
+}
+
+/* 按 UP mid 列出其全部「合集」(seasons_series_list)。
+ * 用途: 视频页 ugc_season 为空时, 反查该视频属于哪个合集 —— 逐个合集拉分集列表比对 bvid。
+ * 结果按 mid 缓存 5 分钟, 避免同一页反复请求。 */
+const SEASONS_LIST_API = 'https://api.bilibili.com/x/polymer/web-space/seasons_series_list';
+const seasonsListCache = new Map();   /* mid -> { t, list } */
+async function fetchUpSeasons(mid) {
+  const key = String(mid);
+  const hit = seasonsListCache.get(key);
+  if (hit && Date.now() - hit.t < 300000) return hit.list;
+  try {
+    const d = await api(SEASONS_LIST_API, { mid, page_num: 1, page_size: 30, web_location: '333.1387' });
+    const wraps = ((d.items_lists || {}).seasons_list) || [];
+    const list = wraps.map(w => {
+      const m = (w && w.meta) || w || {};
+      return { id: String(m.season_id || m.id || ''), name: m.name || '', cover: https(m.cover || ''), total: Number(m.total) || 0 };
+    }).filter(x => x.id);
+    seasonsListCache.set(key, { t: Date.now(), list });
+    return list;
+  } catch (e) { return []; }
+}
+/* 反查: 该视频(或该分P) 属于哪个合集 → 返回 { seasonId, name, cover, mid } 或 null */
+async function findVideoSeason(mid, bvid) {
+  const seasons = await fetchUpSeasons(mid);
+  for (const s of seasons) {
+    try {
+      const page = await fetchSeasonPage(mid, s.id, 1, 50);
+      const hit = (page.archives || []).some(a => a.bvid === bvid);
+      if (hit) return { seasonId: s.id, name: s.name, cover: s.cover, mid: String(mid) };
+    } catch (e) { /* 单个合集失败不影响继续找 */ }
+    await sleep(120);
+  }
+  return null;
 }
 
 const SEASON_API = 'https://api.bilibili.com/x/polymer/web-space/seasons_archives_list';
@@ -762,7 +806,7 @@ async function refreshUp(sub, opt = {}) {
     vlist = opt.full ? await upFullMatches(sub) : await fetchUpVideos(sub.mid, 50);
     items = itemsFromUpVideos(vlist, sub.id, sub.kws || [], sub.exkws || [], ks);
   } else {
-    vlist = await fetchUpVideos(sub.mid, Math.max(50, getSet().backfill || 10));
+    vlist = await fetchUpVideos(sub.mid, 50);
     items = itemsFromUpVideos(vlist, sub.id, sub.kws || [], sub.exkws || [], ks);
   }
   repairUpDurations(vlist);
@@ -903,18 +947,43 @@ async function refreshAll() {
   }
 }
 
-/* 添加订阅。up/season 回填条数默认设置; 可传 opt.backfill 覆盖(如 UP 追更=2)。
+/* 订阅去重签名 —— 同一个 UP 允许存在多条订阅, 但「关键词组合」必须不同:
+ *   mid:k1|k2|k3#e1|e2   (kws 与 exkws 各自排序后归一, 忽略用户输入顺序)
+ * 关键词为空的「全收」订阅签名为 mid:#, 因此同一 UP 最多只有一条全收订阅。
+ * 这样「订阅 UP A 只看 攻略」与「订阅 UP A 只看 直播回放」可以共存,
+ * 各自独立筛选、独立刷新, 互不干扰。 */
+function subSig(type, idPart, kws, exkws) {
+  const norm = a => (a || []).map(s => String(s).trim()).filter(Boolean).sort();
+  return [type, idPart, norm(kws).join('|'), norm(exkws).join('|')].join('#');
+}
+/* 该 UP 已订阅的全部条目(可能多条) */
+function subsOfUp(mid) {
+  return (store.subs || []).filter(s => s.type === 'up' && String(s.mid) === String(mid));
+}
+/* 订阅卡片副标题: 同 UP 多条订阅时带上关键词, 便于一眼区分是哪一条 */
+function subTextOf(sub) {
+  const base = sub.subText || (sub.type === 'up' ? 'UP 投稿' : '订阅');
+  const kw = (sub.kws || []).filter(Boolean);
+  const ex = (sub.exkws || []).filter(Boolean);
+  if (!kw.length && !ex.length) return base;
+  let t = kw.length ? kw.join('+') : '全部';
+  if (ex.length) t += ' 排除' + ex.join('/');
+  return base + ' · ' + t;
+}
+
+/* 添加订阅(订阅即导入当前全部内容, 之后刷新只补新增)。
  * 关键词: kws=匹配(全部命中即收 AND), exkws=排除(命中即丢); 空=不过滤 */
 async function addSubscription(input, kws = [], opt = {}) {
   const p = parseLink(input);
   if (!p) return { ok: false, msg: '链接无法识别' };
   const exkws = Array.isArray(opt.exkws) ? opt.exkws : [];
-  const back = (opt.backfill != null) ? Number(opt.backfill) : (getSet().backfill || 10);
   let sub;
   if (p.type === 'up') {
+    /* 关键词组合相同 → 视为重复; 组合不同 → 允许再建一条 */
+    const sig = subSig('up', p.mid, kws, exkws);
+    const same = subsOfUp(p.mid).find(s => subSig('up', s.mid, s.kws, s.exkws) === sig);
+    if (same) return { ok: false, msg: '该 UP 的这组关键词已在订阅', dup: true, sub: same };
     let info; try { info = await fetchUpInfo(p.mid); } catch (e) { return { ok: false, msg: '获取 UP 信息失败' }; }
-    const oldUp = store.subs.find(s => s.type === 'up' && s.mid === p.mid);
-    if (oldUp) return { ok: false, msg: '该 UP 已在订阅', dup: true, sub: oldUp };
     sub = { id: uid(), type: 'up', name: info.name, face: info.face, mid: p.mid, src: 'uid ' + p.mid,
       subText: 'UP 投稿', kws: kws.slice(), exkws: exkws.slice(), on: true, added: Date.now() };
     store.subs.push(sub);
@@ -982,27 +1051,25 @@ async function addSubscription(input, kws = [], opt = {}) {
             pub: fmtDate(v.created), ts: v.created, subId: sub.id, stat: v.stat,
             st: 'todo', added: Date.now()
           };
-        }).filter(Boolean).slice(0, Math.max(back, 5));
+        }).filter(Boolean);
         repairUpDurations(merged);
         store.items.unshift(...its); added = its.length;
       } else {
-        const vlist = await fetchUpVideos(sub.mid, Math.max(back, 10));
-        const its = itemsFromUpVideos(vlist.slice(0, back), sub.id, sub.kws || [], sub.exkws || [], ks);
+        const vlist = await fetchUpVideos(sub.mid, 50);
+        const its = itemsFromUpVideos(vlist, sub.id, sub.kws || [], sub.exkws || [], ks);
         repairUpDurations(vlist);
         store.items.unshift(...its); added = its.length;
       }
     } else if (sub.type === 'season') {
-      const MAX_PAGES = 12;
-      const need = Math.max(0, back);
+      const MAX_PAGES = 20;
       const batch = [];
-      for (let pn = 1; pn <= MAX_PAGES && added < need; pn++) {
+      for (let pn = 1; pn <= MAX_PAGES; pn++) {
         let page;
         try { page = await fetchSeasonPage(sub.mid, sub.sid, pn, 50, !!sub.isSeries); }
         catch (e) { break; }
         const arcs = page.archives || [];
         if (!arcs.length) break;
         for (const a of arcs) {
-          if (added >= need) break;
           const k = KEY(a.bvid, 0);
           if (ks.has(k)) continue;
           if (!matchKw(a.title, sub.kws || [], sub.exkws || [])) continue;
@@ -1043,7 +1110,7 @@ async function addSubscription(input, kws = [], opt = {}) {
       const its = itemsFromView(view, sub.id, sub.kws || [], sub.exkws || [], ks);
       store.items.unshift(...its); added = its.length;
     }
-  } catch (e) { console.warn('[BilibiliRSS] backfill', e); }
+  } catch (e) { console.warn('[BilibiliRSS] initial import', e); }
   save(); rebuildDedupe();
   return { ok: true, msg: '已加入订阅', sub };
 }
@@ -1055,12 +1122,22 @@ function delSub(id) {
   updateAllUI();
 }
 function toggleSub(id) { const s = store.subs.find(x => x.id === id); if (s) { s.on = !s.on; save(); updateAllUI(); } }
-/* 编辑订阅: 改显示名(关键词内部保留不再展示, 旧数据兼容) */
+/* 编辑订阅筛选规则。
+ * UP 订阅要额外做一次去重: 改后的关键词组合若与该 UP 的另一条订阅撞车,
+ * 会导致两条订阅筛选完全相同 —— 拒绝并保持原值, 由返回值告知调用方。 */
 function editSub(id, kwRaw, exRaw) {
-  const s = store.subs.find(x => x.id === id); if (!s) return;
-  s.kws = kwRaw ? kwRaw.split(/[,，\s]+/).filter(Boolean).map(x => x.trim()).slice(0, 20) : [];
-  s.exkws = exRaw ? exRaw.split(/[,，\s]+/).filter(Boolean).map(x => x.trim()).slice(0, 20) : [];
+  const s = store.subs.find(x => x.id === id); if (!s) return { ok: true };
+  const kws = kwRaw ? kwRaw.split(/[,，\s]+/).filter(Boolean).map(x => x.trim()).slice(0, 20) : [];
+  const exkws = exRaw ? exRaw.split(/[,，\s]+/).filter(Boolean).map(x => x.trim()).slice(0, 20) : [];
+  if (s.type === 'up') {
+    const sig = subSig('up', s.mid, kws, exkws);
+    const clash = subsOfUp(s.mid).find(o => o.id !== s.id && subSig('up', o.mid, o.kws, o.exkws) === sig);
+    if (clash) return { ok: false, msg: '同一 UP 已有相同关键词的订阅，请修改或先删除另一条' };
+  }
+  s.kws = kws;
+  s.exkws = exkws;
   save(); updateAllUI();
+  return { ok: true };
 }
 
 /* 状态机:todo/done/ignored。删除时进 dedupe(下次刷新不再入) */
@@ -1183,7 +1260,7 @@ function gmxArrayBuffer(url, onProg, referer) {
  * CDN 实测(见 build/probe_range.js): bilivideo 对 Range 返回 206 + content-range 总长,
  * 8 并发分块全部 206 → 视频轨按字节分块并发拉, 音频轨保持单线程(体积小, 且省连接数)。
  * 任一环节不支持(无 206 / 分块失败重试耗尽) → 上层回退单线程 gmxArrayBuffer。 */
-const DL_VIDEO_THREADS = 8;
+const DL_VIDEO_THREADS_DEF = 8;   /* 设置缺失时的默认值; 实际以 settings.dlThreads 为准 */
 /* 探测文件总长: Range 0-0 → content-range; 不支持返回 0 */
 function gmxRangeLen(url, referer) {
   return new Promise((res) => {
@@ -1223,7 +1300,10 @@ function gmxChunk(url, start, end, referer, onProg, tries) {
 async function gmxVideoParts(url, onProg, referer) {
   const total = await gmxRangeLen(url, referer);
   if (!total) throw new Error('CDN 不支持 Range');
-  const threads = Math.max(2, Math.min(DL_VIDEO_THREADS, Math.ceil(total / 4194304)));
+  const userThreads = Number(getSet().dlThreads) || DL_VIDEO_THREADS_DEF;
+  /* 每连接至少 4MiB 才开班: 纯 2~4MiB 的小视频即使设了 16 线程也不会真的开 16 条连接
+   * (小文件多连接纯属浪费, 且更容易触发 CDN 限速) */
+  const threads = Math.max(2, Math.min(userThreads, 16, Math.ceil(total / 4194304)));
   if (threads < 2) throw new Error('文件过小, 不值得多线程');
   const chunk = Math.ceil(total / threads);
   const loaded = new Array(threads).fill(0);
@@ -1492,17 +1572,26 @@ function warmFF() {
 }
 
 /* playurl 决策: 返回 { mode:'durl', durl:{url,size,quality} } 或 { mode:'dash', video:{...}, audio:{...}, quality } */
-/* 音轨挑选: mp4a 优先, 同编码内取 id 最大者(码率最高: 30280 > 30232 > 30216) */
-function pickBestAudio(list) {
+/* 音轨挑选: mp4a 优先, 同编码内取 id 最大者(码率最高: 30280 > 30232 > 30216)。
+ * wantId 指定时(仅下载音频的「音质」设置): 取 ≤ wantId 的最高可用档 ——
+ * 例如要 30251(Hi-Res) 但视频只有 30280, 则退到 30280; 指定 30216 则精确取最低档。 */
+function pickBestAudio(list, wantId) {
   const arr = (list || []).slice();
   if (!arr.length) return null;
-  const mp4a = arr.filter(a => /^mp4a/.test(a.codecs || ''));
-  const pool = mp4a.length ? mp4a : arr;
-  return pool.sort((a, b) => (Number(b.id) || 0) - (Number(a.id) || 0))[0];
+  const hasCodec = a => /^mp4a|^ec-3|^flac|^fLaC/i.test(a.codecs || '');
+  let pool = arr.filter(hasCodec);
+  if (!pool.length) pool = arr;
+  const byId = pool.slice().sort((a, b) => (Number(b.id) || 0) - (Number(a.id) || 0));
+  if (wantId) {
+    const want = Number(wantId) || 0;
+    const hit = byId.find(a => (Number(a.id) || 0) <= want);
+    if (hit) return hit;
+  }
+  return byId[0];
 }
 /* 从 playurl 响应里挑视频轨 + 音轨: 视频取 ≤ 目标档的最高轨(h264 优先), 音轨取最高码率。
  * UGC 与番剧共用, 避免两处各写一份。返回 null 表示该响应没有可用 DASH。 */
-function pickDashTracks(resp, want) {
+function pickDashTracks(resp, want, audioWant) {
   const dash = resp && resp.dash;
   if (!dash || !(dash.video || []).length || !(dash.audio || []).length) return null;
   const desc = (resp.accept_quality || []).map(Number).filter(Boolean).sort((a, b) => b - a);
@@ -1512,7 +1601,7 @@ function pickDashTracks(resp, want) {
   const hasCodec = v => /^(avc1|hev1|hvc1|av01)/.test(v.codecs || '');
   const video = vv.find(v => v.id <= target && hasCodec(v))
     || vv.find(v => v.id <= target) || vv.find(v => hasCodec(v)) || vv[0];
-  const audio = pickBestAudio(dash.audio);
+  const audio = pickBestAudio(dash.audio, audioWant);
   if (!video || !audio) return null;
   return { video, audio, quality: Number(video.id) || target, realTop };
 }
@@ -1528,7 +1617,7 @@ async function resolveStream(bvid, cid, wantQn, opt = {}) {
    * 所以这两种形态都跳过直链探测, 直接走 DASH。 */
   if (opt.audioOnly || opt.forceDash) {
     const dd = await reqDash(Math.min(Math.max(want, 80), 127));
-    const tr = pickDashTracks(dd, want);
+    const tr = pickDashTracks(dd, want, opt.audioOnly ? getSet().dlAudioQn : 0);
     if (!tr) throw new Error(opt.audioOnly ? '该视频未提供独立音轨，无法仅下载音频' : '该视频未提供 DASH 流，无法音视频分离');
     if (opt.audioOnly) return { mode: 'audio', audio: tr.audio, quality: Number(tr.audio.id) || 0, timelength: dd.timelength };
     return { mode: 'dash', video: tr.video, audio: tr.audio, quality: tr.quality, timelength: dd.timelength };
@@ -1594,7 +1683,7 @@ async function resolveBangumiStream(task, wantQn, opt = {}) {
   /* 仅下载音频 / 音视频分离: 番剧直链同样是混流单文件 → 跳过它, 直接走 DASH */
   if (opt.audioOnly || opt.forceDash) {
     const dd = await reqUrl(16, Math.min(Math.max(want, 80), 127));
-    const tr = pickDashTracks(dd, want);
+    const tr = pickDashTracks(dd, want, opt.audioOnly ? getSet().dlAudioQn : 0);
     if (!tr) throw new Error(opt.audioOnly ? '该剧集未提供独立音轨，无法仅下载音频' : '该剧集未提供 DASH 流，无法音视频分离');
     if (opt.audioOnly) return { mode: 'audio', audio: tr.audio, quality: Number(tr.audio.id) || 0, timelength: dd.timelength };
     return { mode: 'dash', video: tr.video, audio: tr.audio, quality: tr.quality, timelength: dd.timelength };
@@ -1975,7 +2064,11 @@ const ICO = {
   /* 星标 */
   star: _bi('<path d="M2.866 14.85c-.078.444.36.791.746.593l4.39-2.256 4.389 2.256c.386.198.824-.149.746-.592l-.83-4.73 3.522-3.356c.33-.314.16-.888-.282-.95l-4.898-.696L8.465.792a.513.513 0 0 0-.927 0L5.354 5.12l-4.898.696c-.441.062-.612.636-.283.95l3.523 3.356z"/>'),
   /* 闪电（性能） */
-  zap: _bi('<path d="M11.251.068a.5.5 0 0 1 .227.58L9.677 6.5H13a.5.5 0 0 1 .364.843l-8 8.5a.5.5 0 0 1-.842-.49L6.323 9.5H3a.5.5 0 0 1-.364-.843l8-8.5a.5.5 0 0 1 .615-.09z"/>')
+  zap: _bi('<path d="M11.251.068a.5.5 0 0 1 .227.58L9.677 6.5H13a.5.5 0 0 1 .364.843l-8 8.5a.5.5 0 0 1-.842-.49L6.323 9.5H3a.5.5 0 0 1-.364-.843l8-8.5a.5.5 0 0 1 .615-.09z"/>'),
+  /* 加号 */
+  plus: _bi('<path d="M8 2a.5.5 0 0 1 .5.5v5h5a.5.5 0 0 1 0 1h-5v5a.5.5 0 0 1-1 0v-5h-5a.5.5 0 0 1 0-1h5v-5A.5.5 0 0 1 8 2"/>'),
+  /* 合集 / 专辑（播放列表） */
+  album: _bi('<path d="M6.5 12.5a1.5 1.5 0 1 1-3 0 1.5 1.5 0 0 1 3 0m0-4a1.5 1.5 0 1 1-3 0 1.5 1.5 0 0 1 3 0m0-4a1.5 1.5 0 1 1-3 0 1.5 1.5 0 0 1 3 0"/><path d="M10.5 9a.5.5 0 0 1 .5-.5h4a.5.5 0 0 1 0 1h-4a.5.5 0 0 1-.5-.5m0-4a.5.5 0 0 1 .5-.5h4a.5.5 0 0 1 0 1h-4a.5.5 0 0 1-.5-.5m0-4a.5.5 0 0 1 .5-.5h4a.5.5 0 0 1 0 1h-4a.5.5 0 0 1-.5-.5"/>')
 };
 
 /* ---------------------- 主题 ---------------------- */
@@ -2106,12 +2199,18 @@ function avaHtml(url, fallbackText, cls, extraTitle) {
 }
 
 /* ---------------------- 弹层 ---------------------- */
+/* 输入类标签: 这些元素里的按键是「用户正在打字」, 绝不能漏给宿主页面 */
+const TYPING_TAGS = { INPUT: 1, TEXTAREA: 1, SELECT: 1 };
+const isTypingEl = el => !!(el && TYPING_TAGS[el.tagName]);
 const TL = {
-  _done: null, _key: null,
+  _done: null, _key: null, _key0: null,
   close(val) {
     const m = q('#brsMask'); if (m) m.classList.remove('show');
     const fn = TL._done; TL._done = null;
-    if (TL._key) { document.removeEventListener('keydown', TL._key, true); TL._key = null; }
+    if (TL._key) {
+      for (const t of ['keydown', 'keyup', 'keypress']) document.removeEventListener(t, TL._key, true);
+      TL._key = null;
+    }
     if (fn) fn(val);
   },
   open(cfg) {
@@ -2153,12 +2252,26 @@ const TL = {
     m.classList.add('show');
     const first = fields[0] ? box.querySelector('#tl-' + fields[0].id) : okBtn;
     if (first) setTimeout(() => { try { first.focus(); if (first.select && first.tagName === 'INPUT') first.select(); } catch (e) {} }, 80);
+    /* 键盘处理（capture 阶段, 先于宿主页面拿到事件）。
+     *
+     * 为什么大多数键都要阻止传播: B 站播放器的全局快捷键挂在 document 上,
+     * 我们在 shadow DOM 里输入时事件会一路冒泡到 document 被播放器接管 ——
+     * 典型症状就是「在关键词框里敲空格, 视频反而暂停/播放了」(空格是播放器暂停键),
+     * 左右方向键还会被当成快进/快退。弹层打开期间用户的按键意图都属于弹层,
+     * 所以除明确要交给弹层的键外, 其余在「输入框/文本域聚焦时」一律拦在弹层内。
+     * 只拦 keydown/keyup/keypress, 不动其它事件类型, 不影响页面滚动与点击。 */
+    const typing = () => isTypingEl(document.activeElement) || isTypingEl(m.querySelector('input:focus, textarea:focus'));
     TL._key = ev => {
       if (!m.classList.contains('show')) return;
-      if (ev.key === 'Escape') { ev.stopPropagation(); TL.close(null); }
-      else if (ev.key === 'Enter' && ev.target && ev.target.tagName === 'INPUT' && okBtn) { ev.stopPropagation(); okBtn.click(); }
+      if (ev.key === 'Escape') { ev.stopPropagation(); TL.close(null); return; }
+      if (ev.key === 'Enter' && isTypingEl(ev.target) && okBtn) {
+        ev.stopPropagation(); ev.preventDefault(); okBtn.click(); return;
+      }
+      if (typing()) ev.stopPropagation();
     };
     document.addEventListener('keydown', TL._key, true);
+    document.addEventListener('keyup', TL._key, true);
+    document.addEventListener('keypress', TL._key, true);
     return p;
   },
   show(cfg) { return TL.open(cfg); },
@@ -2510,6 +2623,10 @@ button{font-family:inherit}
 .dlp-meta{font-size:11.5px;color:var(--t3);display:flex;align-items:center;gap:8px;flex-wrap:wrap}
 .dlp-acts{display:flex;gap:7px;margin-top:3px;flex-wrap:wrap}
 .dlp-rows{max-height:200px;overflow-y:auto;margin:8px -4px 0;padding:0 4px;border-top:1px solid rgba(251,114,153,.2)}
+
+.dlp-dlwrap{margin-top:2px;animation:dlpDlIn .18s ease-out}
+
+@keyframes dlpDlIn{from{opacity:0;transform:translateY(-3px)}to{opacity:1;transform:none}}
 .dlp-row{display:flex;align-items:center;gap:8px;padding:5px 6px;font-size:12.3px;cursor:pointer;border-radius:7px;transition:.12s}
 .dlp-row:hover{background:var(--hover)}
 .dlp-row input[type=checkbox]{accent-color:var(--brand);flex:none;width:14px;height:14px;cursor:pointer}
@@ -2528,6 +2645,28 @@ button{font-family:inherit}
 .dlp-sec::after{content:"";flex:1;height:1px;background:rgba(251,114,153,.22)}
 .dlp-sec:first-child{margin-top:4px}
 .dlp-row .dlp-ep{flex:none;font-size:10.5px;color:var(--t3);font-variant-numeric:tabular-nums}
+
+/* ---------- 内联订阅卡片（在工作台里就地填关键词, 不弹全局遮罩） ---------- */
+.dlpk{border:1px dashed rgba(251,114,153,.5);background:var(--panel);border-radius:14px;
+  padding:11px 12px;margin-bottom:12px;box-shadow:var(--shadow-sm);animation:dlpkIn .18s ease-out}
+@keyframes dlpkIn{from{opacity:0;transform:translateY(-4px)}to{opacity:1;transform:none}}
+.dlpk .fld{margin-bottom:9px}
+.dlpk .fld:last-of-type{margin-bottom:0}
+.dlpk .fl{font-size:11.5px;font-weight:800;color:var(--t1);display:flex;align-items:center;gap:6px;margin-bottom:5px}
+.dlpk .fl .hint{font-weight:400;font-size:10.5px;color:var(--t3)}
+.dlpk input[type=text],.dlpk textarea{width:100%;box-sizing:border-box;font-size:12.6px;padding:7px 9px;
+  border-radius:9px;border:1px solid var(--line);background:var(--sunk);color:var(--t1);outline:none;
+  font-family:inherit;transition:border-color .12s}
+.dlpk input[type=text]:focus,.dlpk textarea:focus{border-color:var(--brand)}
+.dlpk input.bad{border-color:#e5484d;animation:dlpkShake .3s}
+@keyframes dlpkShake{25%{transform:translateX(-3px)}75%{transform:translateX(3px)}}
+.dlpk .desc{font-size:10.6px;color:var(--t3);line-height:1.7;margin-top:5px}
+.dlpk .desc b{color:var(--t2)}
+.dlpk .dlpk-ex{margin-top:9px;font-size:11.4px;color:var(--t2);line-height:1.7}
+.dlpk .dlpk-ex ul{margin:3px 0 0;padding-left:17px}
+.dlpk .dlpk-ex .off{color:var(--t3)}
+.dlpk .dlpk-acts{display:flex;gap:7px;justify-content:flex-end;margin-top:11px;
+  padding-top:10px;border-top:1px solid rgba(251,114,153,.2)}
 
 /* ---------- 下载 ---------- */
 .dlhead{display:flex;align-items:center;gap:9px;padding:12px 14px 10px;border-bottom:1px solid var(--line);
@@ -2698,16 +2837,19 @@ const HTML = `
           <div class="setcard">
             <div class="ct">${ICO.gear}通用</div>
             <div class="setrow"><div class="setlabel"><div class="st">系统通知</div><div class="sd">新内容汇总为一条通知，自动去重</div></div><label class="toggle" id="brsSetNotify"></label></div>
-            <div class="setrow"><div class="setlabel"><div class="st">新订阅回填条数</div><div class="sd">新增订阅时把最近 N 条历史投稿放入稍后再看</div></div><div style="display:flex;align-items:center;gap:6px"><input type="number" id="brsSetBackfill" min="0" max="100" step="1"><span style="font-size:12px;color:var(--t3)">条</span></div></div>
           </div>
           <div class="setcard">
             <div class="ct">${ICO.download}下载</div>
             <div class="setrow"><div class="setlabel"><div class="st">下载画质</div><div class="sd">&gt;720P 自动走 DASH 分片 + ffmpeg 合并；引擎加载一次同页复用</div></div>
               <select class="sel" id="brsSetQn"><option value="127">原画 / 最高</option><option value="120">4K</option><option value="116">1080P60</option><option value="80">1080P</option><option value="64">720P</option><option value="32">480P</option><option value="16">360P</option></select></div>
+            <div class="setrow"><div class="setlabel"><div class="st">下载线程数</div><div class="sd">视频分片并发连接数，2~16；调高更快但更吃带宽与 CPU</div></div>
+              <div style="display:flex;align-items:center;gap:6px"><input type="number" id="brsSetThreads" min="2" max="16" step="1"><span style="font-size:12px;color:var(--t3)">线程</span></div></div>
             <div class="setrow"><div class="setlabel"><div class="st">附带弹幕文件</div><div class="sd">下载视频时同目录保存一份弹幕 .xml</div></div><label class="toggle" id="brsSetDanmu"></label></div>
             <div class="setrow"><div class="setlabel"><div class="st">附带封面文件</div><div class="sd">下载视频时同目录保存一张同名封面图（视频封面 / 剧集封面）</div></div><label class="toggle" id="brsSetCover"></label></div>
             <div class="setrow" id="brsRowSplit"><div class="setlabel"><div class="st">音视频分离</div><div class="sd">DASH 不调 ffmpeg 合并，分别保存 <b>.video.m4s</b> 与 <b>.audio.m4s</b> 两个文件</div></div><label class="toggle" id="brsSetSplit"></label></div>
-            <div class="setrow" id="brsRowAudioOnly"><div class="setlabel"><div class="st">仅下载音频</div><div class="sd">只取音轨存为 <b>.m4a</b>（192K），不下视频、不需要 ffmpeg</div></div><label class="toggle" id="brsSetAudioOnly"></label></div>
+            <div class="setrow" id="brsRowAudioOnly"><div class="setlabel"><div class="st">仅下载音频</div><div class="sd">只取音轨存为 <b>.m4a</b>，不下视频、不需要 ffmpeg</div></div><label class="toggle" id="brsSetAudioOnly"></label></div>
+            <div class="setrow" id="brsRowAudioQn"><div class="setlabel"><div class="st">音频音质</div><div class="sd">仅下载音频时的音轨档位；实际可用档取决于视频（Hi-Res / 杜比需大会员内容）</div></div>
+              <select class="sel" id="brsSetAudioQn"><option value="30251">Hi-Res 无损</option><option value="30250">杜比全景声</option><option value="30280">192K</option><option value="30232">132K</option><option value="30216">64K</option></select></div>
           </div>
           <div class="setcard">
             <div class="ct">${ICO.save}数据</div>
@@ -2871,12 +3013,19 @@ function bindUI() {
   const setN = q('#brsSetNotify');
   setN.classList.toggle('on', !!getSet().notify);
   setN.addEventListener('click', () => { setN.classList.toggle('on'); getSet().notify = setN.classList.contains('on'); save(); });
-  const setB = q('#brsSetBackfill');
-  setB.value = getSet().backfill ?? 10;
-  setB.addEventListener('change', () => { getSet().backfill = Math.max(0, parseInt(setB.value) || 0); save(); toast('回填条数已保存'); });
+  const setTh = q('#brsSetThreads');
+  setTh.value = String(Math.min(16, Math.max(2, Number(getSet().dlThreads) || 8)));
+  setTh.addEventListener('change', () => {
+    const v = Math.min(16, Math.max(2, parseInt(setTh.value) || 8));
+    setTh.value = String(v);
+    getSet().dlThreads = v; save(); toast('下载线程数已设为 ' + v);
+  });
   const setQ = q('#brsSetQn'), qv = getSet().dlQn;
   setQ.value = String([127, 120, 116, 80, 64, 32, 16].includes(qv) ? qv : 127);
   setQ.addEventListener('change', () => { getSet().dlQn = parseInt(setQ.value) || 127; save(); toast('下载画质已设为 ' + (setQ.options[setQ.selectedIndex] || {}).text); });
+  const setAq = q('#brsSetAudioQn'), aqv = Number(getSet().dlAudioQn) || 30280;
+  setAq.value = String([30251, 30250, 30280, 30232, 30216].includes(aqv) ? aqv : 30280);
+  setAq.addEventListener('change', () => { getSet().dlAudioQn = parseInt(setAq.value) || 30280; save(); toast('音频音质已设为 ' + (setAq.options[setAq.selectedIndex] || {}).text); });
   const setDm = q('#brsSetDanmu');
   setDm.classList.toggle('on', getSet().dlDanmu !== false);
   setDm.addEventListener('click', () => { setDm.classList.toggle('on'); getSet().dlDanmu = setDm.classList.contains('on'); save(); });
@@ -2888,9 +3037,11 @@ function bindUI() {
   const refreshDlMode = () => {
     setSp.classList.toggle('on', !!getSet().dlSplit);
     setAo.classList.toggle('on', !!getSet().dlAudioOnly);
-    const rowSp = q('#brsRowSplit'), rowAo = q('#brsRowAudioOnly');
+    const rowSp = q('#brsRowSplit'), rowAo = q('#brsRowAudioOnly'), rowAq = q('#brsRowAudioQn');
     if (rowSp) rowSp.classList.toggle('dep-off', !!getSet().dlAudioOnly);
     if (rowAo) rowAo.classList.toggle('dep-off', !!getSet().dlSplit && !getSet().dlAudioOnly);
+    /* 音质行仅在「仅下载音频」开启时可用 */
+    if (rowAq) rowAq.classList.toggle('dep-off', !getSet().dlAudioOnly);
   };
   setSp.addEventListener('click', () => {
     const on = !setSp.classList.contains('on');
@@ -3494,7 +3645,7 @@ function renderSubs() {
     d.innerHTML =
       '<span class="ic ava"></span>' +
       '<div class="submid">' +
-        '<div class="subname"><span class="nm"></span><span class="stype"></span><span class="chip ig off-tag" style="display:none">已停用</span></div>' +
+        '<div class="subname"><span class="nm"></span><span class="stype"></span><span class="chip ig multi-tag" style="display:none"></span><span class="chip ig off-tag" style="display:none">已停用</span></div>' +
         '<div class="subsub"><span class="src"></span><span class="sep"></span><span class="cnt"></span><span class="sep"></span><span class="added"></span></div>' +
         '<div class="subflt" style="display:none"></div>' +
       '</div>' +
@@ -3523,6 +3674,17 @@ function renderSubs() {
     if (nm.textContent !== label) { nm.textContent = label; nm.title = label; }
     const st = $('.stype');
     if (st.__t !== t) { st.__t = t; st.className = 'stype ' + t; st.textContent = typeLabel(s); }
+    /* 同一个 UP 可能有多条订阅(各自不同关键词) → 用「第 n/m 条」小标记区分, 否则
+     * 列表里会出现两行完全同名的 UP 卡片, 用户无从分辨。 */
+    const multi = $('.multi-tag');
+    const sib = (t === 'up' && s.mid) ? subsOfUp(s.mid) : [];
+    const mi = sib.findIndex(x => x.id === s.id);
+    const mTxt = (sib.length > 1 && mi >= 0) ? ('第 ' + (mi + 1) + '/' + sib.length + ' 条') : '';
+    if (multi.__t !== mTxt) {
+      multi.__t = mTxt;
+      multi.textContent = mTxt;
+      multi.style.display = mTxt ? '' : 'none';
+    }
     const offTag = $('.off-tag');
     const showOff = !s.on;
     if ((offTag.style.display !== 'none') !== showOff) offTag.style.display = showOff ? '' : 'none';
@@ -3596,7 +3758,8 @@ async function onSubsClick(ev) {
       okText: '保存'
     });
     if (!r) return;
-    editSub(sid, r.fields.kws.trim(), r.fields.exkws.trim());
+    const er = editSub(sid, r.fields.kws.trim(), r.fields.exkws.trim());
+    if (er && !er.ok) { toast(er.msg || '保存失败'); return; }
     renderSubs(); renderChips();
     const nk = (store.subs.find(x => x.id === sid) || {}).kws || [];
     toast(nk.length ? ('筛选已更新，需同时包含：' + nk.join('、')) : '筛选已更新，将收录全部投稿');
@@ -3719,6 +3882,11 @@ function onDlClick(ev) {
 /* ============================ 工作台（页面识别操作卡） ============================ */
 let dlPickCache = { key: '', html: '', t: 0 };
 let dlPickBusy = false;
+/* 合集/专辑页的下载区默认折叠, 只露资料卡。用户点过「下载」展开后要记住这个选择 ——
+ * 否则每 15 秒缓存窗口一过 DOM 重建, 展开状态会被静默重置回折叠。
+ * key 用 pathname+search, 换页面即失效, 不会把 A 页的展开态带到 B 页。 */
+let dlDlOpenKey = '';
+const key0 = () => location.pathname + location.search;
 function renderDlPick() {
   const hostEl = q('#brsDlPick');
   if (!hostEl) return;
@@ -3816,7 +3984,7 @@ function detectPagePick() {
             ]) +
           '</div></div>' +
         '<div class="dlp-rows">' + rows + '</div>' +
-        '<div class="dlp-foot"><span class="dl-sum sel-n">下载所选 (' + meta.eps.length + ')</span><span class="sp"></span>' + dlSelBtn(meta.eps.length) + '</div></div>';
+        '<div class="dlp-foot">' + dlSelBtn(meta.eps.length) + '</div></div>';
     });
   }
   /* ---------- 视频页 ---------- */
@@ -3832,10 +4000,33 @@ function detectPagePick() {
       const midAttr = view.mid ? ' data-mid="' + view.mid + '"' : '';
       const metaTxt = esc(view.author || '') + ' · 目标画质 ' + qnName(getSet().dlQn || 127) +
         (view.stat && view.stat.view ? ' · ' + numFmt(view.stat.view) + ' 播放' : '');
-      const acts = [];
+      const acts = [actBtn('todo-add', ICO.plus + '加入稍后再看', false)];
       if (view.mid) acts.push(actBtn('sub-up', ICO.layers + '订阅该 UP', false), actBtn('mon', ICO.radar + '加监控', false));
+      /* 合集卡: 视频属于某个「合集」时额外渲染一张卡(封面 + UP + 一键订阅整季)。
+       * ugc_season 直接给了就用; 没给则按 UP 反查(逐个合集比对 bvid)。反查是异步的,
+       * 不阻塞主卡渲染 —— 先出主卡, 合集卡就绪后追加。 */
+      const seasonCard = () => {
+        const mk = sg => {
+          const encName = encodeURIComponent(sg.name || '');
+          return '<div class="dlpick" data-kind="season" data-mid="' + attr(sg.mid) + '" data-sid="' + attr(sg.seasonId) + '">' +
+            pickHead('视频所属合集') +
+            '<div class="dlp-body">' +
+              (sg.cover ? '<img src="' + attr(sg.cover) + '" class="dlp-cover" onerror="this.style.display=\'none\'">' : '') +
+              '<div class="dlp-info">' +
+                '<div class="dlp-name">' + esc(sg.name || ('合集 ' + sg.seasonId)) + '</div>' +
+                '<div class="dlp-meta">' + esc(view.author || '') + ' · ' + (sg.count ? (sg.count + ' 个视频') : '合集') + '</div>' +
+                actRow([actBtn('sub-season-page', ICO.layers + '订阅该合集', false)]) +
+              '</div></div></div>';
+        };
+        if (view.ugc) {
+          return Promise.resolve(mk({ seasonId: view.ugc.id, name: view.ugc.title, cover: view.ugc.cover, mid: view.mid, count: view.ugc.count }));
+        }
+        if (!view.mid) return Promise.resolve('');
+        return findVideoSeason(view.mid, bvid).then(sg => sg ? mk(Object.assign({}, sg, { count: 0 })) : '').catch(() => '');
+      };
+
       if (pages.length <= 1) {
-        return '<div class="dlpick" data-kind="video" data-bvid="' + bvid + '" data-pid="1" data-title="' + titleEnc + '"' + midAttr + ' data-upname="' + upNameEnc + '" data-pic="' + attr(view.pic || '') + '">' +
+        const main = '<div class="dlpick" data-kind="video" data-bvid="' + bvid + '" data-pid="1" data-title="' + titleEnc + '"' + midAttr + ' data-upname="' + upNameEnc + '" data-pic="' + attr(view.pic || '') + '">' +
           pickHead('当前视频', '<span class="rt">' + (view.length ? fmtTime(view.length) : '') + '</span>') +
           '<div class="dlp-body">' +
             (view.pic ? '<img src="' + attr(view.pic) + '" class="dlp-cover" onerror="this.style.display=\'none\'">' : '') +
@@ -3844,18 +4035,20 @@ function detectPagePick() {
               '<div class="dlp-meta">' + metaTxt + '<span class="chip p">' + esc(bvid) + '</span></div>' +
               actRow(acts.concat([actBtn('dl-one', ICO.download + '下载', true)])) +
             '</div></div></div>';
+        return seasonCard().then(extra => main + extra);
       }
       const rows = pages.map((p, i) =>
         '<label class="dlp-row"><input type="checkbox" class="dlp-cb" checked data-bvid="' + bvid + '" data-pid="' + (i + 1) + '" data-title="' + encodeURIComponent((view.title || bvid) + ' P' + (i + 1)) + '" data-pic="' + attr(view.pic || '') + '">' +
         '<span class="dlp-pn">P' + (i + 1) + '</span><span class="dlp-pt" title="' + attr(p.part || '') + '">' + esc(p.part || ('分P ' + (i + 1))) + '</span>' +
         '<span class="dlp-pd">' + fmtTime(p.duration) + '</span></label>').join('');
-      return '<div class="dlpick" data-kind="multi" data-bvid="' + bvid + '" data-title="' + titleEnc + '"' + midAttr + ' data-upname="' + upNameEnc + '">' +
+      const mainMulti = '<div class="dlpick" data-kind="multi" data-bvid="' + bvid + '" data-title="' + titleEnc + '"' + midAttr + ' data-upname="' + upNameEnc + '" data-vtitle="' + titleEnc + '">' +
         pickHead('当前视频 · ' + pages.length + ' 个分P',
           '<label style="font-size:11px;color:var(--t2);display:flex;align-items:center;gap:4px;cursor:pointer"><input type="checkbox" id="brsDlPickAll" checked style="accent-color:var(--brand)">全选</label>') +
         '<div class="dlp-meta" style="margin:0 0 2px">' + esc(view.title || bvid) + '</div>' +
         actRow(acts) +
         '<div class="dlp-rows">' + rows + '</div>' +
-        '<div class="dlp-foot"><span class="dl-sum sel-n">下载所选 (' + pages.length + ')</span><span class="sp"></span>' + dlSelBtn(pages.length) + '</div></div>';
+        '<div class="dlp-foot">' + dlSelBtn(pages.length) + '</div></div>';
+      return seasonCard().then(extra => mainMulti + extra);
     });
   }
   /* ---------- 合集/专辑(空间「合集和列表」) ---------- */
@@ -3888,18 +4081,26 @@ function detectPagePick() {
         '<span class="dlp-pd">' + fmtTime(a.duration || a.length || 0) + '</span></label>').join('');
       const author = (arcs.find(x => x.author) || {}).author || '';
       const kindName = isSeries ? '专辑' : '合集';
+      /* 合集/专辑动辄几十上百集, 全量列表铺开会把工作台撑成一条长柱, 挡住页面本身。
+       * 所以默认只给「资料卡」(封面 / 名称 / 集数 / 订阅按钮), 下载区收进 .dlp-dlwrap,
+       * 由「下载」按钮切换 display —— 列表 HTML 照旧预渲染好, 揭开是纯 CSS 切换, 不重新拉接口。 */
+      const open = dlDlOpenKey === key0();
       return '<div class="dlpick" data-kind="season" data-mid="' + attr(mid) + '" data-sid="' + attr(sid) + '">' +
-        pickHead('当前' + kindName,
-          '<label style="font-size:11px;color:var(--t2);display:flex;align-items:center;gap:4px;cursor:pointer"><input type="checkbox" id="brsDlPickAll" checked style="accent-color:var(--brand)">全选</label>') +
+        pickHead('当前' + kindName, '<span class="rt">共 ' + arcs.length + ' 集</span>') +
         '<div class="dlp-body">' +
           (metaCover ? '<img src="' + attr(metaCover) + '" class="dlp-cover" onerror="this.style.display=\'none\'">' : '') +
           '<div class="dlp-info">' +
             '<div class="dlp-name">' + esc(metaName || (author ? author + ' 的' + kindName : kindName + ' sid ' + sid)) + '</div>' +
             '<div class="dlp-meta">' + kindName + '<span class="chip p">共 ' + arcs.length + ' 集</span></div>' +
-            actRow([actBtn('sub-season', ICO.layers + '订阅该' + kindName, false)]) +
+            actRow([
+              actBtn('sub-season', ICO.layers + '订阅该' + kindName, false),
+              actBtn('season-dl-open', ICO.download + (open ? '收起' : '下载'), false)
+            ]) +
           '</div></div>' +
-        '<div class="dlp-rows">' + rows + '</div>' +
-        '<div class="dlp-foot"><span class="dl-sum sel-n">下载所选 (' + arcs.length + ')</span><span class="sp"></span>' + dlSelBtn(arcs.length) + '</div></div>';
+        '<div class="dlp-dlwrap"' + (open ? '' : ' style="display:none"') + '>' +
+          '<div class="dlp-rows">' + rows + '</div>' +
+          '<div class="dlp-foot">' + dlSelBtn(arcs.length) + '</div>' +
+        '</div></div>';
     });
   }
   /* ---------- UP 空间页 ---------- */
@@ -3931,7 +4132,29 @@ function bindDlPick() {
   if (all) all.addEventListener('change', () => onPickAll(all.checked));
   pick.querySelectorAll('.dlp-cb').forEach(cb => cb.addEventListener('change', selN));
   pick.querySelectorAll('[data-ava]').forEach(el => { const u = el.dataset.ava; if (u) warmAva(el, u); });
+  /* 切 Tab / 缓存失效会重建 DOM, 重建后把用户此前展开的下载区还原回去 */
+  const wrap = pick.querySelector('.dlp-dlwrap');
+  if (wrap) {
+    const open = dlDlOpenKey === key0();
+    wrap.style.display = open ? '' : 'none';
+    const b = pick.querySelector('[data-act="season-dl-open"]');
+    if (b) b.innerHTML = ICO.download + (open ? '收起' : '下载');
+  }
   selN();
+}
+/* 合集/专辑卡片底部下载区的展开 / 收起。列表 HTML 早已渲染好, 这里只切 display。 */
+function toggleSeasonDl(b) {
+  const card = b.closest('.dlpick');
+  const wrap = card && card.querySelector('.dlp-dlwrap');
+  if (!wrap) return;
+  const open = wrap.style.display === 'none';
+  wrap.style.display = open ? '' : 'none';
+  b.innerHTML = ICO.download + (open ? '收起' : '下载');
+  dlDlOpenKey = open ? key0() : '';
+  if (open) {
+    card.querySelectorAll('.dlp-cb').forEach(cb => { cb.checked = true; });
+    selN();
+  }
 }
 async function onDlPickClick(ev) {
   const pick = q('#brsDlPick');
@@ -3940,15 +4163,27 @@ async function onDlPickClick(ev) {
   if (!b || b.disabled) return;
   b.disabled = true;
   try {
-    const card = pick.querySelector('.dlpick');
+    /* 用按钮所在的那张卡读数据, 不能用 pick.querySelector('.dlpick') ——
+     * 视频页可能同时存在主卡与合集卡, 取「第一张」会读到错误的 mid/sid。 */
+    const card = b.closest('.dlpick') || pick.querySelector('.dlpick');
     const D = card ? card.dataset : {};
     const act = b.dataset.act;
     if (act === 'sub-up') {
       if (!D.mid) { toast('未获取到 UP 信息'); return; }
       await subscribeUp(D.mid, D.upname ? decodeURIComponent(D.upname) : undefined,
-        { defKw: D.title ? decodeURIComponent(D.title) : '' });
+        { defKw: D.title ? decodeURIComponent(D.title) : '', anchor: card });
     } else if (act === 'sub-season') {
       await subscribeSeasonNow();
+    } else if (act === 'season-dl-open') {
+      /* 合集/专辑页: 下载区默认折叠, 这里只负责揭开/收起(不拉接口) */
+      toggleSeasonDl(b);
+    } else if (act === 'sub-season-page') {
+      /* 视频页里的「合集卡」按钮: 用卡片自己带的 sid/mid 订阅(与所在页面 URL 无关) */
+      if (!D.sid || !D.mid) { toast('未获取到合集信息'); return; }
+      await subscribeSeasonById(D.mid, D.sid, false);
+    } else if (act === 'todo-add') {
+      /* 把当前视频(多分P则只收当前选中/全部分P)加入稍后再看 */
+      await addCurrentToTodo(pick, D);
     } else if (act === 'sub-bangumi') {
       await subscribeBangumiNow('https://www.bilibili.com/bangumi/play/ss' + D.ssid);
     } else if (act === 'bg-all') {
@@ -3992,29 +4227,170 @@ async function onDlPickClick(ev) {
  * 订阅即建即显: 先落库并显示订阅信息(头像/昵称), 再后台抓取内容;
  * 合集/番剧订阅 = 当前全部内容一次导入, 之后每次刷新只补新增。
  * 关键词: 标题须同时命中全部(AND); 排除词: 命中任一即排除 */
-async function askSubKw(upName, defKw = '') {
-  const r = await TL.open({
-    title: '订阅「' + upName + '」',
-    desc: '设置筛选关键词（可选）',
-    icon: ICO.search,
-    okText: '开始订阅',
-    fields: [
-      {
-        id: 'kw', label: '匹配关键词', hint: 'AND · 留空 = 全收',
-        value: defKw || '', placeholder: '逗号或空格分隔',
-        note: '标题需<b>同时包含全部</b>关键词才会收进稍后再看'
-      },
-      {
-        id: 'ex', label: '排除关键词', hint: '命中任一即跳过',
-        value: '', placeholder: '留空 = 不排除'
-      }
-    ]
-  });
-  if (!r || !r.ok) return null;   /* 用户取消 */
+/* 关键词输入 —— 内联卡片（不弹全局遮罩）。
+ *
+ * 为什么不做成弹窗: 弹窗盖住整个页面, 用户看不到当前视频/UP 的信息, 而且
+ * 打开弹窗期间播放器快捷键仍在后台生效(在输入框里敲空格会把视频暂停)。
+ * 改成在工作台里就地插一张卡片: 位置紧贴触发它的卡片下方, 视野内,
+ * 确认/取消后自动移除。返回 { kws, exkws } 或 null(取消)。
+ *
+ * anchor: 插入位置参考节点, 卡片插到它后面; 不传则插到 #brsDlPick 末尾。
+ * exist:  该 UP 已有的订阅数组(可能多条), 列出已用过的关键词组合避免建重复。 */
+function askSubKwInline(upName, defKw = '', exist = [], anchor = null) {
+  let hostEl = q('#brsDlPick');
+  if (!hostEl) return Promise.resolve(null);
+  const old = hostEl.querySelector('#brsSubKwCard');
+  if (old) old.remove();
+
+  /* 先把抽屉打开、页签切到「工作台」—— 必须赶在插卡之前做。
+   * 因为 switchTab('bench') 会触发 renderDlPick() 把 #brsDlPick 的 innerHTML 整个
+   * 重建一遍, 插好的卡片会被一起抹掉。切换后容器可能换了新节点, 所以要重新取一次;
+   * anchor 也可能随旧节点一起被替换, 失效时退化成「插到工作台末尾」。 */
+  const anchorAct = ensureBenchVisible(anchor);
+  hostEl = q('#brsDlPick');
+  if (!hostEl) return Promise.resolve(null);
+
+  const existHtml = (exist || []).length
+    ? '<div class="dlpk-ex"><div>该 UP 已有 ' + exist.length + ' 条订阅，填一组<b>不同</b>的关键词即可再订阅一次：</div><ul>'
+      + exist.map(s => {
+          const kw = (s.kws || []).filter(Boolean), ex = (s.exkws || []).filter(Boolean);
+          let t = kw.length ? kw.join('+') : '全部投稿';
+          if (ex.length) t += '（排除 ' + ex.join('/') + '）';
+          return '<li>' + esc(t) + (s.on ? '' : ' <span class="off">· 已停用</span>') + '</li>';
+        }).join('')
+      + '</ul></div>'
+    : '';
+
+  const card = document.createElement('div');
+  card.className = 'dlpk';
+  card.id = 'brsSubKwCard';
+  card.innerHTML =
+    '<div class="dlp-title"><span class="hb">' + ICO.search + '订阅「' + esc(upName) + '」</span>' +
+      '<span class="rt" style="margin-left:auto;font-size:11px;color:var(--t3)">设置筛选关键词（可选）</span></div>' +
+    '<div class="fld"><div class="fl">匹配关键词<span class="hint">AND · 留空 = 全收</span></div>' +
+      '<input type="text" id="brsKwMain" placeholder="逗号或空格分隔" value="' + attr(defKw || '') + '">' +
+      '<div class="desc">标题需<b>同时包含全部</b>关键词才会收进稍后再看</div></div>' +
+    '<div class="fld"><div class="fl">排除关键词<span class="hint">命中任一即跳过</span></div>' +
+      '<input type="text" id="brsKwEx" placeholder="留空 = 不排除"></div>' +
+    existHtml +
+    '<div class="dlpk-acts">' +
+      '<button class="sbtn" id="brsKwCancel" type="button">取消</button>' +
+      '<button class="sbtn pink" id="brsKwOk" type="button">开始订阅</button>' +
+    '</div>';
+  /* anchor 若在重建中被换掉, anchorAct 会是 null, 此时插到末尾 */
+  if (anchorAct && anchorAct.parentNode === hostEl) anchorAct.insertAdjacentElement('afterend', card);
+  else hostEl.appendChild(card);
+
+  const main = card.querySelector('#brsKwMain');
+  let settled = false, resolve;
+  const p = new Promise(res => { resolve = res; });
+
+  /* 键盘拦截挂在 document 的「捕获」阶段 —— 这是整条传播链的最上游。
+   *
+   * 为什么不在 card 上拦: B 站播放器把快捷键监听挂在 document 上, document 的捕获
+   * 监听总是比 card 的捕获监听先跑; 挂在 card 上就是慢一步, 根本轮不到。
+   *
+   * 为什么不用 document.activeElement 判「是否在打字」: 事件来自 shadow DOM 内部时,
+   * activeElement 会被重定向成宿主 #brs-host(不是 INPUT), 判定必然失败(实测已验证)。
+   * 所以只认事件的真实目标 —— shadow DOM 内部事件在 document 层同样被重定向,
+   * 必须用 composedPath() 才能回看到 INPUT 本身。 */
+  const inCard = ev => {
+    try {
+      const path = ev.composedPath ? ev.composedPath() : [];
+      if (path.length) return path.indexOf(card) >= 0;
+    } catch (e) {}
+    return !!(ev.target && (ev.target === card || card.contains(ev.target)));
+  };
+  const realTarget = ev => {
+    try {
+      const path = ev.composedPath ? ev.composedPath() : [];
+      for (const n of path) { if (n && TYPING_TAGS[n.tagName]) return n; }
+    } catch (e) {}
+    return isTypingEl(ev.target) ? ev.target : null;
+  };
+  /* 用 stopImmediatePropagation 而不是 stopPropagation:
+   * 同一个节点上同阶段的监听是按「注册顺序」跑的, 本监听注册得晚, 单靠
+   * stopPropagation 只能挡住它之后注册的, 挡不住之前注册的同类监听。
+   * stopImmediatePropagation 能一次性掐断该节点上所有后续监听 —— 这是后注册者
+   * 能拿到的最强手段, 也正是这里必须用的。 */
+  const onKey0 = ev => {
+    if (settled || !inCard(ev)) return;
+    const t = realTarget(ev);
+    if (ev.key === 'Escape') { ev.preventDefault(); ev.stopImmediatePropagation(); cancel(); return; }
+    if (ev.key === 'Enter' && t) { ev.preventDefault(); ev.stopImmediatePropagation(); ok(); return; }
+    if (t) { ev.stopImmediatePropagation(); ev.stopPropagation(); }
+  };
+  const onKey0up = ev => {
+    if (settled || !inCard(ev) || !realTarget(ev)) return;
+    ev.stopImmediatePropagation(); ev.stopPropagation();
+  };
+
+  /* 卡片回收时把监听摘干净, 否则 document 上会残留旧监听:
+   * 轻则下次开卡重复拦截, 重则误伤页面上别的输入框 */
+  const done = val => {
+    if (settled) return;
+    settled = true;
+    document.removeEventListener('keydown', onKey0, true);
+    document.removeEventListener('keyup', onKey0up, true);
+    document.removeEventListener('keypress', onKey0up, true);
+    if (TL._key0 === onKey0) TL._key0 = null;
+    card.remove();
+    resolve(val);
+  };
   const split = v => String(v || '').trim()
     ? String(v).split(/[,，\s]+/).filter(Boolean).map(s => s.trim()).slice(0, 20)
     : [];
-  return { kws: split(r.fields.kw), exkws: split(r.fields.ex) };
+  const ok = () => done({ kws: split(main.value), exkws: split(card.querySelector('#brsKwEx').value) });
+  const cancel = () => done(null);
+
+  TL._key0 = onKey0;
+  document.addEventListener('keydown', onKey0, true);
+  document.addEventListener('keyup', onKey0up, true);
+  document.addEventListener('keypress', onKey0up, true);
+
+  card.querySelector('#brsKwOk').addEventListener('click', ok);
+  card.querySelector('#brsKwCancel').addEventListener('click', cancel);
+
+  /* 自动聚焦。
+   *
+   * 必须等输入框真的拿到布局盒再聚焦 —— 实测: 若卡片所在容器还是 display:none,
+   * 或宿主 #brs-host(width:0;height:0) 里尚未完成布局, 输入框 getClientRects()
+   * 会返回空, 浏览器**静默拒绝** focus, 用户看到的就是「点了订阅但什么都没发生」。
+   * 上面 ensureBenchVisible() 已保证容器可见, 这里再轮询等布局落地, 拿到盒子才聚焦。 */
+  let tries = 0;
+  const tryFocus = () => {
+    if (settled) return;
+    if (main.getClientRects().length) {
+      try { main.focus(); main.select(); } catch (e) {}
+      return;
+    }
+    if (++tries > 40) return;   /* ~1s 后放弃, 不做无限轮询 */
+    setTimeout(tryFocus, 25);
+  };
+  setTimeout(tryFocus, 30);
+  return p;
+}
+/* 把抽屉打开、并把页签切到「工作台」—— 关键词卡片就插在那儿。
+ *
+ * 不这么做的话, 卡片会被插进一个 display:none 的容器:
+ * 用户在视频页点「订阅该 UP」, 面板却停在别的页签, 卡片既看不见、输入框也拿不到
+ * 布局盒(浏览器会静默拒绝 focus), 用户会觉得整个按钮失灵了。
+ *
+ * 返回 anchor: 切页签会触发 renderDlPick() 重建 #brsDlPick 的内部 DOM,
+ * 传进来的 anchor 节点可能已随旧 DOM 一起被丢弃 —— 那时返回 null, 让调用方插到末尾。
+ * 若节点还活着(没发生重建), 原样返回。 */
+function ensureBenchVisible(anchor) {
+  const d = q('#drawer');
+  if (d && !d.classList.contains('show')) {
+    d.classList.add('show');
+    const f = q('#fab'); if (f) f.classList.add('close-state');
+  }
+  if (V.tab !== 'bench') switchTab('bench');
+  if (!anchor) return null;
+  /* 重取一次容器, 看 anchor 是否还在同一棵子树里 */
+  const hostEl = q('#brsDlPick');
+  if (hostEl && anchor.parentNode === hostEl && hostEl.contains(anchor)) return anchor;
+  return null;
 }
 /* 后台收尾: 抓取该订阅的内容并入库, 完成后更新列表 + 提示新增数 */
 async function bgFinishSub(sub) {
@@ -4025,20 +4401,28 @@ async function bgFinishSub(sub) {
     if (added) toast('已导入 ' + added + ' 条到稍后再看');
   } catch (e) { console.warn('[BilibiliRSS] bg refresh', sub && sub.id, e); }
 }
-/* 订阅 UP(mid): 未订阅→问关键词(视频页自动预填当前标题); 已订阅→直接后台刷新 */
+/* 订阅 UP(mid)。
+ * 同一个 UP 允许建多条订阅 —— 只要关键词组合不同(例如「攻略」与「直播回放」)；
+ * 关键词完全相同的组合则视为重复, 直接刷新已有那条。
+ * 所以即便该 UP 已有订阅, 也照常弹关键词框, 让用户决定是新开一条还是复用自己的筛选。
+ *
+ * opt.anchor: 关键词卡片要插到哪个节点之后(通常是触发它的那张工作台卡片)。
+ *             不传则插到工作台末尾。 */
 async function subscribeUp(mid, upName, opt = {}) {
-  const existing = store.subs.find(s => s.type === 'up' && String(s.mid) === String(mid));
-  if (existing) {
-    if (!existing.on) { toast('该 UP 订阅已停用，请到订阅页点电源图标启用'); return true; }
-    toast('该 UP 已在订阅，后台刷新中…');
-    bgFinishSub(existing);
-    return true;
-  }
+  const exist = subsOfUp(mid);
   if (!upName) {
     try { const info = await fetchUpInfo(mid); upName = info && info.name; } catch (e) {}
   }
-  const kw = await askSubKw(upName || ('UP ' + mid), opt.defKw || '');
+  const kw = await askSubKwInline(upName || ('UP ' + mid), opt.defKw || '', exist, opt.anchor || null);
   if (!kw) return true;   /* 用户取消 */
+  const sig = subSig('up', mid, kw.kws, kw.exkws);
+  const same = exist.find(s => subSig('up', s.mid, s.kws, s.exkws) === sig);
+  if (same) {
+    if (!same.on) { toast('该关键词组合的订阅已停用，请到订阅页点电源图标启用'); return true; }
+    toast('该关键词组合已在订阅，后台刷新中…');
+    bgFinishSub(same);
+    return true;
+  }
   toast('订阅中…');
   const r = await addSubscription(String(mid), kw.kws, { exkws: kw.exkws, noBackfill: true });
   if (r.ok && r.sub) {
@@ -4047,7 +4431,7 @@ async function subscribeUp(mid, upName, opt = {}) {
       (kw.kws.length ? '(关键词 ' + kw.kws.join('、') + ')' : '') + '，后台抓取中…');
     bgFinishSub(r.sub);
   } else if (r.dup && r.sub) {
-    updateAllUI(); toast('该 UP 已在订阅');
+    updateAllUI(); toast(r.msg || '该 UP 已在订阅');
     bgFinishSub(r.sub);
   } else {
     updateAllUI(); toast(r.msg || '订阅失败');
@@ -4078,6 +4462,65 @@ async function subscribeSeasonNow() {
   } else {
     updateAllUI(); toast(r.msg || '订阅失败');
   }
+}
+/* 用 mid + sid 直接订阅合集/专辑(不依赖当前页面 URL) —— 供视频页的合集卡使用 */
+async function subscribeSeasonById(mid, sid, isSeries) {
+  const kn = isSeries ? '专辑' : '合集';
+  const existing = store.subs.find(s => s.type === 'season' && String(s.sid) === String(sid) && String(s.mid) === String(mid));
+  if (existing) {
+    if (!existing.on) { toast('该' + kn + '订阅已停用，请到订阅页点电源图标启用'); return; }
+    toast('该' + kn + '已在订阅，后台刷新中…');
+    bgFinishSub(existing);
+    return;
+  }
+  toast('订阅中…');
+  const link = 'https://space.bilibili.com/' + mid + '/lists/' + sid + (isSeries ? '?type=series' : '');
+  const r = await addSubscription(link, [], { noBackfill: true });
+  if (r.ok && r.sub) {
+    updateAllUI();
+    toast('已订阅' + kn + '「' + (r.sub.name || '') + '」，正在导入全部视频…');
+    bgFinishSub(r.sub);
+  } else if (r.dup && r.sub) {
+    updateAllUI(); toast('该' + kn + '已在订阅');
+    bgFinishSub(r.sub);
+  } else {
+    updateAllUI(); toast(r.msg || '订阅失败');
+  }
+}
+/* 把当前视频加入稍后再看。
+ * 单分P: 一条; 多分P: 每分P一条, 命名「分P名 - 视频标题」(P1 无独立分P名时用主标题)。
+ * 标题本身已含序号的情况(「第1话」等)交给用户自行判断, 不做猜测改写。 */
+async function addCurrentToTodo(pick, D) {
+  const bvid = D.bvid || (location.pathname.match(/\/video\/(BV[a-zA-Z0-9]+)/) || [])[1] || '';
+  if (!bvid) { toast('未获取到视频信息'); return; }
+  const view = await fetchView(bvid);
+  if (!view) { toast('获取视频信息失败'); return; }
+  const pages = (view.pages && view.pages.length) ? view.pages : [{ cid: 0, part: '', duration: view.length }];
+  const vtitle = view.title || bvid;
+  const ks = new Set([...dedupeSet, ...(store.ignore || [])]);
+  const batch = [];
+  /* 多分P时只收勾选中的行(尊重用户的勾选), 单分P直接收 */
+  const checkedPids = new Set(Array.from(pick.querySelectorAll('.dlp-cb:checked')).map(cb => Number(cb.dataset.pid || 1)));
+  let skipped = 0;
+  pages.forEach((p, i) => {
+    const pid = i + 1;
+    if (pages.length > 1 && checkedPids.size && !checkedPids.has(pid)) return;
+    const k = KEY(bvid, pid);
+    if (ks.has(k)) { skipped++; return; }
+    ks.add(k);
+    const partName = (pages.length > 1) ? ((p.part || '').trim() || ('P' + pid)) : '';
+    const title = partName ? (partName + ' - ' + vtitle) : vtitle;
+    batch.push({
+      id: uid(), key: k, bvid, pid, cid: p.cid || 0,
+      title, author: view.author || '', face: '', pic: view.pic || '',
+      dur: fmtTime(p.duration || view.length), pub: fmtDate(view.pubdate), ts: view.pubdate,
+      subId: '', stat: view.stat || {}, st: 'todo', added: Date.now()
+    });
+  });
+  if (!batch.length) { toast(skipped ? '已在稍后再看中（' + skipped + ' 条）' : '没有可加入的内容'); return; }
+  store.items.unshift(...batch);
+  save(); rebuildDedupe(); updateAllUI();
+  toast('已加入稍后再看 ' + batch.length + ' 条' + (skipped ? '（跳过已在列表的 ' + skipped + ' 条）' : ''));
 }
 /* 订阅番剧(ss/ep 链接): 全部剧集一次导入(含 OP/ED/花絮各 section) */
 async function subscribeBangumiNow(link) {

@@ -26,3 +26,9 @@ node_modules/
 
 # 本地预览文件
 preview.html
+
+# 本地回归脚本与临时产物(不进版本库)
+.test*.js
+.gh*.js
+.ghauth.json
+.out_*.txt
