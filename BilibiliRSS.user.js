@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BilibiliRSS
 // @namespace    https://github.com/xinbaji/BilibiliRSS
-// @version      0.3.3
+// @version      0.3.4
 // @description  B站稍后再看 · UP/合集/视频订阅追更 · 增量监控 · 下载(直链+DASH ffmpeg合并mp4)+弹幕XML（独立油猴版）
 // @author       xinbaji
 // @match        https://www.bilibili.com/*
@@ -146,7 +146,7 @@ function md5(str) {
 /* ============================ 存储 ============================ */
 const NS = 'BilibiliRSS';
 const DEFAULTS = {
-  ver: '0.3.3',
+  ver: '0.3.4',
   settings: {
     notify: true, backfill: 10, dlQn: 127, dlDanmu: true,
     /* v0.3.1 下载形态开关 */
@@ -334,13 +334,24 @@ function parseLink(input) {
   if (m) return { type: 'bangumi', ssid: m[1] };
   m = s.match(/bangumi\/play\/ep(\d+)/i) || s.match(/^ep(\d+)$/i);
   if (m) return { type: 'bangumi', epId: m[1] };
-  /* 合集: 旧路由 /mid/channel/collectiondetail?sid= 与新路由 /mid/lists?sid= 都认 */
+  /* 合集/系列(空间「合集和列表」)三种 URL 形态:
+   *   旧路由(query):   /mid/channel/collectiondetail?sid=xxx
+   *   新路由(query):   /mid/lists?sid=xxx
+   *   新路由(path):    /mid/lists/xxx  (?type=season|series)  ← 2025 起主流, sid 在路径里
+   * type=series 的 sid 是「系列/专辑」id, 走 x/series/archives 接口, 与合集接口不同 */
   m = s.match(/space\.bilibili\.com\/(\d+)\/(?:channel\/collectiondetail|lists)/i);
   if (m) {
-    let sid = null;
-    try { sid = new URL(/^https?:\/\//i.test(s) ? s : 'https://' + s).searchParams.get('sid'); }
-    catch (e) { sid = (s.match(/[?&]sid=(\d+)/) || [])[1] || null; }
-    if (sid) return { type: 'season', mid: m[1], sid };
+    let sid = null, isSeries = false;
+    try {
+      const u = new URL(/^https?:\/\//i.test(s) ? s : 'https://' + s);
+      sid = u.searchParams.get('sid');
+      isSeries = u.searchParams.get('type') === 'series';
+      if (!sid) { const pm = u.pathname.match(/\/lists\/(\d+)/i); if (pm) sid = pm[1]; }
+    } catch (e) {
+      sid = (s.match(/[?&]sid=(\d+)/) || [])[1] || (s.match(/\/lists\/(\d+)/i) || [])[1] || null;
+      isSeries = /type=series/i.test(s);
+    }
+    if (sid) return { type: 'season', mid: m[1], sid, isSeries };
   }
   if ((m = s.match(/space\.bilibili\.com\/(\d+)/))) return { type: 'up', mid: m[1] };
   if ((m = s.match(/bilibili\.com\/video\/(BV[a-zA-Z0-9]+)/))) return { type: 'ugc', bvid: m[1] };
@@ -438,6 +449,7 @@ async function fetchUpAjax(mid, keyword = '', maxPages = 2) {
 const is412 = e => /412|风控|access rejected/i.test(String((e && e.message) || e));
 
 async function fetchUpVideos(mid, ps = 50) {
+  let wbiErr = null;
   if (!arcBlocked()) {
     try {
       const d = await api(ARC_URL,
@@ -446,10 +458,17 @@ async function fetchUpVideos(mid, ps = 50) {
       return ((d.list && d.list.vlist) || []).map(mapUpVideo);
     } catch (e) {
       if (is412(e)) arcMarkQuiet();
+      wbiErr = e;
     }
   }
-  /* 被 412 静默期/失败时: 走 ajax 兜底 */
-  try { return await fetchUpAjax(mid, ''); } catch (e2) { return []; }
+  /* 被 412 静默期/失败时: 走 ajax 兜底。注意旧 ajax 接口已逐步下线(匿名实测返回空体),
+   * 若它也拿不到数据且 wbi 通道刚失败 → 大概率整条链路被风控, 抛错让上层提示,
+   * 不再静默返空 —— 否则用户「刷新无新增」和「接口挂了」完全无法区分。 */
+  const ajaxOut = await fetchUpAjax(mid, '').catch(() => []);
+  if (!ajaxOut.length && (wbiErr || arcBlocked())) {
+    throw new Error((wbiErr && wbiErr.message) || '空间投稿接口受限(412), 请稍后重试');
+  }
+  return ajaxOut;
 }
 
 /* UP 空间投稿关键词搜索 —— v0.1.29 起改为 keyword 服务端直搜:
@@ -511,7 +530,21 @@ async function fetchView(bvid) {
 }
 
 const SEASON_API = 'https://api.bilibili.com/x/polymer/web-space/seasons_archives_list';
-async function fetchSeasonPage(mid, sid, pn, ps = 50) {
+/* 系列(旧「专辑」)接口: 与合集不同的另一套 id 体系(?type=series 页面) */
+const SERIES_API = 'https://api.bilibili.com/x/series/archives';
+async function fetchSeasonPage(mid, sid, pn, ps = 50, isSeries = false) {
+  if (isSeries) {
+    const d = await api(SERIES_API, { mid, series_id: sid, pn, ps });
+    const archives = d.archives || [];
+    const meta = d.meta || {};
+    const total = (d.page && d.page.total) || meta.total || archives.length;
+    return {
+      archives,
+      meta: { name: meta.name || '', cover: https(meta.cover || ''), total },
+      total,
+      hasMore: (pn * ps) < total
+    };
+  }
   const d = await api(SEASON_API, { mid, season_id: sid, page_num: pn, page_size: ps, sort_reverse: false });
   return {
     archives: d.archives || [],
@@ -520,8 +553,8 @@ async function fetchSeasonPage(mid, sid, pn, ps = 50) {
     hasMore: (pn * ps) < ((d.page && d.page.total) || (d.meta && d.meta.total) || 0)
   };
 }
-async function fetchSeasonMeta(mid, sid) {
-  const p = await fetchSeasonPage(mid, sid, 1, 1);
+async function fetchSeasonMeta(mid, sid, isSeries = false) {
+  const p = await fetchSeasonPage(mid, sid, 1, 1, isSeries);
   return p.meta;
 }
 
@@ -758,7 +791,7 @@ async function refreshSeason(sub) {
   const MAX_PAGES = 20;
   for (let pn = 1; pn <= MAX_PAGES; pn++) {
     let page;
-    try { page = await fetchSeasonPage(sub.mid, sub.sid, pn, 50); }
+    try { page = await fetchSeasonPage(sub.mid, sub.sid, pn, 50, !!sub.isSeries); }
     catch (e) { break; }
     const arcs = page.archives;
     if (!arcs || !arcs.length) break;
@@ -813,6 +846,7 @@ async function refreshBangumi(sub) {
 /* v0.1.29: 同一订阅并发去重 —— 订阅后 bgFinishSub 与开面板 refreshAll 可能同时触发,
  * 若不加锁, 两者各自基于旧 dedupeSet 计算, 会把同一稿件插两份进稍后再看 */
 const subRefreshing = new Set();
+let subFailTold = {};   /* 订阅刷新失败 toast 节流: subId -> ts */
 async function refreshSub(sub, opt = {}) {
   if (!sub.on) return { added: 0 };
   const k = sub.id || sub.bvid || sub.mid || sub.ssid;
@@ -823,7 +857,17 @@ async function refreshSub(sub, opt = {}) {
     if (sub.type === 'season') return await refreshSeason(sub);
     if (sub.type === 'ugc') return await refreshUgc(sub);
     if (sub.type === 'bangumi') return await refreshBangumi(sub);
-  } catch (e) { console.warn('[BilibiliRSS] refreshSub', sub.id, e); }
+  } catch (e) {
+    console.warn('[BilibiliRSS] refreshSub', sub.id, e);
+    /* 不再完全静默: 接口失败要给用户一个可感知的信号(同一订阅 60s 只提示一次) */
+    const name = String(sub.name || sub.bvid || sub.mid || sub.ssid || '订阅').slice(0, 20);
+    const now = Date.now();
+    if (!subFailTold || !subFailTold[sub.id] || now - subFailTold[sub.id] > 60000) {
+      subFailTold = subFailTold || {};
+      subFailTold[sub.id] = now;
+      try { toast('刷新「' + name + '」失败: ' + shortErr(e)); } catch (e2) {}
+    }
+  }
   finally { subRefreshing.delete(k); }
   return { added: 0 };
 }
@@ -875,16 +919,17 @@ async function addSubscription(input, kws = [], opt = {}) {
       subText: 'UP 投稿', kws: kws.slice(), exkws: exkws.slice(), on: true, added: Date.now() };
     store.subs.push(sub);
   } else if (p.type === 'season') {
+    const isSeries = !!p.isSeries;
     const [info, meta] = await Promise.all([
       fetchUpInfo(p.mid).catch(() => null),
-      fetchSeasonMeta(p.mid, p.sid).catch(() => null)
+      fetchSeasonMeta(p.mid, p.sid, isSeries).catch(() => null)
     ]);
-    if (!meta) return { ok: false, msg: '合集不存在或已失效' };
+    if (!meta) return { ok: false, msg: (isSeries ? '专辑' : '合集') + '不存在或已失效' };
     const oldSe = store.subs.find(s => s.type === 'season' && s.sid === p.sid && s.mid === p.mid);
-    if (oldSe) return { ok: false, msg: '该合集已在订阅', dup: true, sub: oldSe };
-    const sname = meta.name || (meta.title ? ('合集·' + meta.title) : ('合集 ' + p.sid));
-    sub = { id: uid(), type: 'season', name: sname, face: info?.face || '', author: info?.name || ('UP' + p.mid),
-      mid: p.mid, sid: p.sid, src: '合集 sid ' + p.sid, subText: '合集投稿',
+    if (oldSe) return { ok: false, msg: (isSeries ? '该专辑' : '该合集') + '已在订阅', dup: true, sub: oldSe };
+    const sname = meta.name || (meta.title ? (isSeries ? '系列·' : '合集·') + meta.title : (isSeries ? '系列 ' : '合集 ') + p.sid);
+    sub = { id: uid(), type: 'season', isSeries, name: sname, face: info?.face || '', author: info?.name || ('UP' + p.mid),
+      mid: p.mid, sid: p.sid, src: (isSeries ? '系列 sid ' : '合集 sid ') + p.sid, subText: isSeries ? '系列(专辑)' : '合集投稿',
       kws: kws.slice(), exkws: exkws.slice(), on: true, added: Date.now(),
       baselineTs: Math.floor(Date.now() / 1000) };
     store.subs.push(sub);
@@ -952,7 +997,7 @@ async function addSubscription(input, kws = [], opt = {}) {
       const batch = [];
       for (let pn = 1; pn <= MAX_PAGES && added < need; pn++) {
         let page;
-        try { page = await fetchSeasonPage(sub.mid, sub.sid, pn, 50); }
+        try { page = await fetchSeasonPage(sub.mid, sub.sid, pn, 50, !!sub.isSeries); }
         catch (e) { break; }
         const arcs = page.archives || [];
         if (!arcs.length) break;
@@ -3441,6 +3486,7 @@ function renderSubs() {
   if (el.__sig) { el.__sig = ''; el.innerHTML = ''; }
   const typeName = t => t === 'season' ? '合集'
     : (t === 'up' ? 'UP 投稿' : (t === 'bangumi' ? '番剧' : '分P视频'));
+  const typeLabel = s => (s.type === 'season' && s.isSeries) ? '专辑' : typeName(s.type);
 
   patchList(el, ss, s => s.id, () => {
     const d = document.createElement('div');
@@ -3476,7 +3522,7 @@ function renderSubs() {
     const label = s.name || '(未命名)';
     if (nm.textContent !== label) { nm.textContent = label; nm.title = label; }
     const st = $('.stype');
-    if (st.__t !== t) { st.__t = t; st.className = 'stype ' + t; st.textContent = typeName(t); }
+    if (st.__t !== t) { st.__t = t; st.className = 'stype ' + t; st.textContent = typeLabel(s); }
     const offTag = $('.off-tag');
     const showOff = !s.on;
     if ((offTag.style.display !== 'none') !== showOff) offTag.style.display = showOff ? '' : 'none';
@@ -3812,36 +3858,46 @@ function detectPagePick() {
         '<div class="dlp-foot"><span class="dl-sum sel-n">下载所选 (' + pages.length + ')</span><span class="sp"></span>' + dlSelBtn(pages.length) + '</div></div>';
     });
   }
-  /* ---------- 合集页 ---------- */
+  /* ---------- 合集/专辑(空间「合集和列表」) ---------- */
   if (/^\/\d+\/channel\/collectiondetail/.test(path) || /^\/\d+\/lists/.test(path)) {
-    /* 分支条件已保证第二个斜杠存在, 但统一用正则取, 防将来入口变化时踩同款坑 */
+    /* sid 两种位置: query(?sid=, 旧路由) 与 path(/lists/<sid>, 2025 起新路由);
+     * type=series 的 sid 是「系列/专辑」id, 走另一套接口, 需要透传 */
     const mid = (path.match(/^\/(\d+)/) || [])[1] || '';
-    const sid = new URLSearchParams(location.search).get('sid');
+    const usp = new URLSearchParams(location.search);
+    const sid = usp.get('sid') || (path.match(/\/lists\/(\d+)/) || [])[1] || '';
+    const isSeries = usp.get('type') === 'series';
     if (!mid || !sid) return Promise.reject(new Error('no sid'));
     const loadAll = async () => {
-      const out = []; let metaName = '';
+      const out = []; let metaName = ''; let metaCover = '';
       for (let pn = 1; pn <= 4; pn++) {
-        const page = await fetchSeasonPage(mid, sid, pn, 50);
+        const page = await fetchSeasonPage(mid, sid, pn, 50, isSeries);
         if (page.meta && page.meta.name) metaName = page.meta.name;
+        if (page.meta && page.meta.cover) metaCover = page.meta.cover;
         const arcs = page.archives || [];
         out.push(...arcs);
         if (!page.hasMore) break;
         await sleep(150);
       }
-      return { arcs: out, metaName };
+      return { arcs: out, metaName, metaCover };
     };
-    return loadAll().then(({ arcs, metaName }) => {
+    return loadAll().then(({ arcs, metaName, metaCover }) => {
       if (!arcs.length) throw new Error('empty');
       const rows = arcs.map((a, i) =>
         '<label class="dlp-row"><input type="checkbox" class="dlp-cb" checked data-bvid="' + a.bvid + '" data-pid="1" data-title="' + encodeURIComponent(a.title || a.bvid) + '" data-pic="' + attr(a.pic || '') + '">' +
         '<span class="dlp-pn">' + (i + 1) + '</span><span class="dlp-pt" title="' + attr(a.title || '') + '">' + esc(a.title || '') + '</span>' +
         '<span class="dlp-pd">' + fmtTime(a.duration || a.length || 0) + '</span></label>').join('');
       const author = (arcs.find(x => x.author) || {}).author || '';
+      const kindName = isSeries ? '专辑' : '合集';
       return '<div class="dlpick" data-kind="season" data-mid="' + attr(mid) + '" data-sid="' + attr(sid) + '">' +
-        pickHead('当前合集',
+        pickHead('当前' + kindName,
           '<label style="font-size:11px;color:var(--t2);display:flex;align-items:center;gap:4px;cursor:pointer"><input type="checkbox" id="brsDlPickAll" checked style="accent-color:var(--brand)">全选</label>') +
-        '<div class="dlp-meta" style="margin:0 0 2px">' + esc(metaName || (author + ' 的合集')) + '<span class="chip p">共 ' + arcs.length + ' 集</span></div>' +
-        actRow([actBtn('sub-season', ICO.layers + '订阅该合集', false)]) +
+        '<div class="dlp-body">' +
+          (metaCover ? '<img src="' + attr(metaCover) + '" class="dlp-cover" onerror="this.style.display=\'none\'">' : '') +
+          '<div class="dlp-info">' +
+            '<div class="dlp-name">' + esc(metaName || (author ? author + ' 的' + kindName : kindName + ' sid ' + sid)) + '</div>' +
+            '<div class="dlp-meta">' + kindName + '<span class="chip p">共 ' + arcs.length + ' 集</span></div>' +
+            actRow([actBtn('sub-season', ICO.layers + '订阅该' + kindName, false)]) +
+          '</div></div>' +
         '<div class="dlp-rows">' + rows + '</div>' +
         '<div class="dlp-foot"><span class="dl-sum sel-n">下载所选 (' + arcs.length + ')</span><span class="sp"></span>' + dlSelBtn(arcs.length) + '</div></div>';
     });
@@ -4001,11 +4057,12 @@ async function subscribeUp(mid, upName, opt = {}) {
 /* 订阅当前合集页: 立即把全部现有分P导入稍后再看; 之后每次刷新只补新增分P */
 async function subscribeSeasonNow() {
   const p = parseLink(location.href);
-  if (!p || p.type !== 'season') { toast('当前不是合集页'); return; }
+  if (!p || p.type !== 'season') { toast('当前不是合集/专辑页'); return; }
+  const kn = p.isSeries ? '专辑' : '合集';
   const existing = store.subs.find(s => s.type === 'season' && String(s.sid) === String(p.sid) && String(s.mid) === String(p.mid));
   if (existing) {
-    if (!existing.on) { toast('该合集订阅已停用，请到订阅页点电源图标启用'); return; }
-    toast('该合集已在订阅，后台刷新中…');
+    if (!existing.on) { toast('该' + kn + '订阅已停用，请到订阅页点电源图标启用'); return; }
+    toast('该' + kn + '已在订阅，后台刷新中…');
     bgFinishSub(existing);
     return;
   }
@@ -4013,10 +4070,10 @@ async function subscribeSeasonNow() {
   const r = await addSubscription(location.href, [], { noBackfill: true });
   if (r.ok && r.sub) {
     updateAllUI();
-    toast('已订阅合集「' + (r.sub.name || '') + '」，正在导入全部现有分P…');
+    toast('已订阅' + kn + '「' + (r.sub.name || '') + '」，正在导入全部现有分P…');
     bgFinishSub(r.sub);
   } else if (r.dup && r.sub) {
-    updateAllUI(); toast('该合集已在订阅');
+    updateAllUI(); toast('该' + kn + '已在订阅');
     bgFinishSub(r.sub);
   } else {
     updateAllUI(); toast(r.msg || '订阅失败');

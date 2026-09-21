@@ -3,7 +3,7 @@
 > 让 B 站自动帮你「收视频、追番、盯数据、下视频」的浏览器脚本 —— 数据全部存在你自己电脑上。
 
 ![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)
-![Version](https://img.shields.io/badge/version-0.3.3-pink.svg)
+![Version](https://img.shields.io/badge/version-0.3.4-pink.svg)
 ![Platform](https://img.shields.io/badge/需要-Tampermonkey-00485c.svg)
 
 打开 B 站任意视频页或 UP 主页，屏幕右下角会出现一颗粉色悬浮球，点开就是一个小面板：**订阅追更、稍后再看、下载视频、数据监控**，四件事一站搞定。所有数据只保存在你的浏览器里。
