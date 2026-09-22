@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BilibiliRSS
 // @namespace    https://github.com/xinbaji/BilibiliRSS
-// @version      0.3.7
+// @version      0.3.8
 // @description  B站稍后再看 · UP/合集/视频订阅追更 · 增量监控 · 下载(直链+DASH ffmpeg合并mp4)+弹幕XML（独立油猴版）
 // @author       xinbaji
 // @match        https://www.bilibili.com/*
@@ -63,6 +63,7 @@ function shortErr(e) {
     [/GM_download/i, () => '下载已取消或通道超时'],
     [/GM_xmlhttpRequest/i, () => '下载通道错误'],
     [/Failed to fetch|NetworkError|Load failed/i, () => '网络连接失败'],
+    [/停滞/, () => '网络停滞(长时间无数据)'],
     [/超时|timeout/i, () => '网络超时'],
     [/网络错误|分块失败/, () => '网络错误'],
     [/引擎加载失败|ffmpeg/i, () => '下载引擎加载失败(可改用 ≤720P)']
@@ -146,7 +147,7 @@ function md5(str) {
 /* ============================ 存储 ============================ */
 const NS = 'BilibiliRSS';
 const DEFAULTS = {
-  ver: '0.3.7',
+  ver: '0.3.8',
   settings: {
     notify: true, dlQn: 127, dlDanmu: true,
     /* v0.3.1 下载形态开关 */
@@ -1243,15 +1244,34 @@ const FF_CDN = [
   { name: 'unpkg', base: 'https://unpkg.com/@ffmpeg/ffmpeg@0.12.15/dist/umd', core: 'https://unpkg.com/@ffmpeg/core@0.12.10/dist/umd', coremt: 'https://unpkg.com/@ffmpeg/core-mt@0.12.10/dist/umd' }
 ];
 
+/* 停滞看门狗窗口: 只在「一个字节都没涨」时计时, 一有进展就重新计时。
+ * 为什么不设「总时长」上限: 大文件在慢链路上本来就该慢慢下, 定死总时长会把正常任务掐掉
+ * (之前 5 秒掐断就是这么来的)。只看有没有进展, 既能救回真卡死的连接, 又不误伤慢速下载。 */
+const DL_STALL_MS = 120000;
+
 function gmxArrayBuffer(url, onProg, referer) {
   return new Promise((res, rej) => {
-    GM_xmlhttpRequest({
-      method: 'GET', url, responseType: 'arraybuffer', timeout: 0,
+    let h = null, done = false, got = 0, timer = null;
+    const stop = () => { if (timer) { clearTimeout(timer); timer = null; } };
+    const armed = () => {
+      stop();
+      timer = setTimeout(() => {
+        if (done) return;
+        done = true;
+        try { h && h.abort(); } catch (e) {}
+        rej(new Error('停滞 ' + (got / 1048576).toFixed(1) + 'MB 无数据'));
+      }, DL_STALL_MS);
+    };
+    const fail = m => { if (done) return; done = true; stop(); rej(new Error(m)); };
+    armed();
+    h = GM_xmlhttpRequest({
+      method: 'GET', url, responseType: 'arraybuffer',
       headers: { Referer: referer || 'https://www.bilibili.com/', 'User-Agent': navigator.userAgent },
-      onloadstart: r => { try { if (onProg) { const cl = /content-length:\s*(\d+)/i.exec(r.responseHeaders || ''); if (cl) onProg(0, Number(cl[1])); } } catch (e) {} },
-      onprogress: r => { try { if (onProg && r.total) onProg(r.loaded, r.total); } catch (e) {} },
-      onload: r => { if (r.status >= 200 && r.status < 300) res(r.response); else rej(new Error('HTTP ' + r.status)); },
-      onerror: () => rej(new Error('网络错误')), ontimeout: () => rej(new Error('超时'))
+      onloadstart: r => { try { if (onProg) { const cl = /content-length:\s*(\d+)/i.exec(r.responseHeaders || ''); if (cl) onProg(0, Number(cl[1])); } } catch (e) {} armed(); },
+      onprogress: r => { got = r.loaded || got; try { if (onProg && r.total) onProg(r.loaded, r.total); } catch (e) {} armed(); },
+      onload: r => { if (done) return; done = true; stop(); if (r.status >= 200 && r.status < 300) res(r.response); else rej(new Error('HTTP ' + r.status)); },
+      onerror: () => fail('网络错误'),
+      ontimeout: () => fail('超时')
     });
   });
 }
@@ -1276,44 +1296,109 @@ function gmxRangeLen(url, referer) {
     });
   });
 }
-/* 单个 Range 分块, 自带重试; 非 206 视为不支持 Range → 直接抛错触发整体回退 */
-function gmxChunk(url, start, end, referer, onProg, tries) {
-  const n = Math.max(1, tries || 3);
+/* 单个 Range 分块: 停滞看门狗 + 退避重试。
+ * 非 206 抛错(交给上层降并发/回退); 4xx 里除 408/429 外重试没有意义, 直接放弃。 */
+function gmxChunk(url, start, end, referer, onProg, tries, reg) {
+  const n = Math.max(1, tries || 4);
   const once = () => new Promise((res, rej) => {
-    GM_xmlhttpRequest({
-      method: 'GET', url, responseType: 'arraybuffer', timeout: 0,
+    let h = null, done = false, timer = null;
+    const stop = () => { if (timer) { clearTimeout(timer); timer = null; } };
+    const armed = () => {
+      stop();
+      timer = setTimeout(() => {
+        if (done) return;
+        done = true;
+        try { h && h.abort(); } catch (e) {}
+        rej(new Error('停滞'));
+      }, DL_STALL_MS);
+    };
+    const fail = m => { if (done) return; done = true; stop(); rej(new Error(m)); };
+    armed();
+    h = GM_xmlhttpRequest({
+      method: 'GET', url, responseType: 'arraybuffer',
       headers: { Referer: referer || 'https://www.bilibili.com/', 'User-Agent': navigator.userAgent, Range: 'bytes=' + start + '-' + end },
-      onprogress: r => { try { if (onProg) onProg(r.loaded || 0); } catch (e) {} },
-      onload: r => { if (r.status === 206) res(r.response); else rej(new Error('HTTP ' + r.status)); },
-      onerror: () => rej(new Error('网络错误')), ontimeout: () => rej(new Error('超时'))
+      onprogress: r => { try { if (onProg) onProg(r.loaded || 0); } catch (e) {} armed(); },
+      onload: r => { if (done) return; done = true; stop(); if (r.status === 206) res(r.response); else rej(new Error('HTTP ' + r.status)); },
+      onerror: () => fail('网络错误'),
+      ontimeout: () => fail('超时')
     });
+    /* 句柄登记给调用方, 便于整体判负时把这些还在跑的请求一起掐掉 */
+    if (reg) { try { reg(h); } catch (e) {} }
   });
   return (async () => {
     let last;
     for (let i = 0; i < n; i++) {
-      try { return await once(); } catch (e) { last = e; }
+      try { return await once(); }
+      catch (e) {
+        last = e;
+        const m = /^HTTP (\d+)/.exec((e && e.message) || '');
+        if (m) {
+          const code = Number(m[1]);
+          /* 403 防盗链 / 404 地址过期这类, 再重试也是同样的结果 */
+          if (code >= 400 && code < 500 && code !== 408 && code !== 429) break;
+        }
+        if (i < n - 1) await sleep(400 * Math.pow(2, i));   /* 400 → 800 → 1600ms */
+      }
     }
-    throw last || new Error('分块失败');
+    throw new Error(((last && last.message) || '分块失败') + ' · 块 ' + start + '-' + end);
   })();
 }
-/* 视频轨多线程: 返回按序分块数组 ArrayBuffer[](落盘零拷贝; 合并路径用 joinParts 拼回) */
-async function gmxVideoParts(url, onProg, referer) {
+/* 视频轨多线程: 返回按序分块数组 ArrayBuffer[](落盘零拷贝; 合并路径用 joinParts 拼回)
+ * maxThreads: 覆盖用户设置, 供「降并发重试」逐级调低; 不传则用 settings.dlThreads */
+async function gmxVideoParts(url, onProg, referer, maxThreads) {
   const total = await gmxRangeLen(url, referer);
   if (!total) throw new Error('CDN 不支持 Range');
-  const userThreads = Number(getSet().dlThreads) || DL_VIDEO_THREADS_DEF;
+  const userThreads = Number(maxThreads) || Number(getSet().dlThreads) || DL_VIDEO_THREADS_DEF;
   /* 每连接至少 4MiB 才开班: 纯 2~4MiB 的小视频即使设了 16 线程也不会真的开 16 条连接
    * (小文件多连接纯属浪费, 且更容易触发 CDN 限速) */
   const threads = Math.max(2, Math.min(userThreads, 16, Math.ceil(total / 4194304)));
   if (threads < 2) throw new Error('文件过小, 不值得多线程');
   const chunk = Math.ceil(total / threads);
   const loaded = new Array(threads).fill(0);
-  const upd = () => { try { if (onProg) onProg(loaded.reduce((a, b) => a + b, 0), total); } catch (e) {} };
-  const parts = await Promise.all(Array.from({ length: threads }, (_, i) => {
-    const s = i * chunk, e = Math.min(total - 1, s + chunk - 1);
-    return gmxChunk(url, s, e, referer, l => { loaded[i] = l; upd(); }, 3)
-      .then(buf => { loaded[i] = buf.byteLength || (e - s + 1); upd(); return buf; });
-  }));
-  return parts;
+  const hs = [];
+  /* 一旦整体判负就把兄弟们全掐掉: 否则失败的那几块还在重试, 其余连接也仍占着 CDN 的并发
+   * 额度, 而紧接着的降并发/单线程重试又要去抢同一批连接 —— 互相拖死, 还白烧流量。 */
+  let dead = false;
+  const upd = () => {
+    if (dead) return;
+    try { if (onProg) onProg(loaded.reduce((a, b) => a + b, 0), total); } catch (e) {}
+  };
+  const reg = h => { if (h) hs.push(h); };
+  try {
+    return await Promise.all(Array.from({ length: threads }, (_, i) => {
+      const s = i * chunk, e = Math.min(total - 1, s + chunk - 1);
+      return gmxChunk(url, s, e, referer, l => { loaded[i] = l; upd(); }, 4, reg)
+        .then(buf => { loaded[i] = buf.byteLength || (e - s + 1); upd(); return buf; });
+    }));
+  } catch (e) {
+    dead = true;
+    for (const h of hs) { try { h.abort(); } catch (e2) {} }
+    throw e;
+  }
+}
+/* 拉视频轨: 先按用户线程数多线程, 失败则逐级降并发重试, 最后才回退单线程。
+ *
+ * 为什么不一步回退单线程: 多数失败是并发太高被 CDN 限流, 8 条降到 4 条往往就通了;
+ * 直接退回单线程等于把速度砍到 1/8, 还白扔掉已经下好的分块。 */
+async function gmxVideoTrack(url, onProg, referer) {
+  let top = Number(getSet().dlThreads) || DL_VIDEO_THREADS_DEF;
+  top = Math.max(2, Math.min(top, 16));
+  const ladder = [];
+  for (let t = top; t >= 2; t = Math.floor(t / 2)) ladder.push(t);
+  let last = null;
+  for (let i = 0; i < ladder.length; i++) {
+    try {
+      if (i) console.warn('[BilibiliRSS] 视频轨降至 ' + ladder[i] + ' 线程重试');
+      return await gmxVideoParts(url, onProg, referer, ladder[i]);
+    } catch (e) {
+      last = e;
+      /* 地址本身就不支持 Range, 降并发也救不回来, 直接回退 */
+      if (/不支持 Range|文件过小/.test((e && e.message) || '')) throw e;
+      if (i < ladder.length - 1) await sleep(600 * (i + 1));
+    }
+  }
+  console.warn('[BilibiliRSS] 视频轨多线程回退单线程:', (last && last.message) || last);
+  return [await gmxArrayBuffer(url, onProg, referer)];
 }
 /* 按序拼接分块(合并路径需要连续 buffer 交给 ffmpeg) */
 function joinParts(parts) {
@@ -1823,13 +1908,8 @@ async function dlTick() {
     };
     const dlRef = next.epId ? bgReferer(next.bgSsid || '', next.epId) : '';
     const [vparts, ab] = await Promise.all([
-      (async () => {
-        try { return await gmxVideoParts(plan.video.baseUrl, (l, t) => { vDone = l; vTotal = t || vTotal; updSub(); }, dlRef); }
-        catch (e) {
-          console.warn('[BilibiliRSS] 视频轨多线程回退单线程:', e && e.message);
-          return [await gmxArrayBuffer(plan.video.baseUrl, (l, t) => { vDone = l; vTotal = t || vTotal; updSub(); }, dlRef)];
-        }
-      })(),
+      /* 视频轨: 多线程 → 逐级降并发 → 单线程, 兜底逻辑全在 gmxVideoTrack 里 */
+      gmxVideoTrack(plan.video.baseUrl, (l, t) => { vDone = l; vTotal = t || vTotal; updSub(); }, dlRef),
       gmxArrayBuffer(plan.audio.baseUrl, (l, t) => { aDone = l; aTotal = t || aTotal; updSub(); }, dlRef)
     ]);
     const vLen = vparts.reduce((a, b) => a + (b.byteLength || 0), 0);
@@ -1886,18 +1966,39 @@ async function dlTick() {
       dlTick();
     }
   } catch (e) {
-    /* plan 阶段(尚未开始拉分片)失败 → 弱网常见, 自动回队重试至多 3 次;
-     * 业务性错误(大会员/付费/地区/未提供音轨等)不重试直接判死; 开始下载后失败维持判死 */
     const msg = (e && e.message) || String(e);
-    if (!next.planDone && (next.rPlan || 0) < 3 && !/需大会员|付费|地区限制|缺少 cid|需登录|未提供/.test(msg)) {
+    /* 业务性错误(大会员/付费/地区/未提供音轨)重试没有意义, 直接判死 */
+    if (/需大会员|付费|地区限制|缺少 cid|需登录|未提供/.test(msg)) {
+      next.rPlan = 0; next.rMedia = 0;
+      next.st = 'err'; next.err = msg; save(); updateAllUI();
+      toast('下载失败: ' + shortErr(next.err));
+      dlTick();
+      return;
+    }
+    /* ① 连播放地址都还没拿到: 弱网常见, 回队重试至多 3 次 */
+    if (!next.planDone && (next.rPlan || 0) < 3) {
       next.rPlan = (next.rPlan || 0) + 1;
       next.st = 'queue'; next.prog = 0; next.sub = '网络不佳, 自动重试 ' + next.rPlan + '/3';
       next.err = msg; save(); updateAllUI();
       toast('网络不佳, 自动重试 ' + next.rPlan + '/3: ' + shortErr(msg));
-      dlTick();
+      setTimeout(dlTick, 1500 * next.rPlan);   /* 退避, 别立刻再撞一次 */
       return;
     }
-    next.rPlan = 0;
+    /* ② 地址拿到了、分片下到一半断掉。
+     * 以前这里直接判死 —— 一次网络抖动就废掉整个任务, 正是「多线程回退单线程之后还是红超时」
+     * 的成因。现在回队重试至多 2 次, 并把 planDone 清掉以便重新取地址:
+     * B 站 playurl 的 CDN 地址自带时效, 排队久了会过期, 重取正好一并解决。 */
+    if (next.planDone && (next.rMedia || 0) < 2) {
+      next.rMedia = (next.rMedia || 0) + 1;
+      next.rPlan = 0; next.planDone = false;
+      next.st = 'queue'; next.prog = 0;
+      next.sub = '下载中断, 重新取地址重试 ' + next.rMedia + '/2';
+      next.err = msg; save(); updateAllUI();
+      toast('下载中断, 自动重试 ' + next.rMedia + '/2: ' + shortErr(msg));
+      setTimeout(dlTick, 3000 * next.rMedia);
+      return;
+    }
+    next.rPlan = 0; next.rMedia = 0;
     next.st = 'err'; next.err = msg; save(); updateAllUI();
     toast('下载失败: ' + shortErr(next.err));
     dlTick();
