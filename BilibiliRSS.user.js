@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BilibiliRSS
 // @namespace    https://github.com/xinbaji/BilibiliRSS
-// @version      0.4.0
+// @version      0.4.1
 // @description  B站稍后再看 · UP/合集/视频订阅追更 · 增量监控 · 下载(直链+DASH ffmpeg合并mp4)+弹幕XML（独立油猴版）
 // @author       xinbaji
 // @updateURL    https://ghproxy.net/https://github.com/xinbaji/BilibiliRSS/releases/latest/download/BilibiliRSS.user.js
@@ -146,10 +146,17 @@ function md5(str) {
 
 
 
-/* ============================ 存储 ============================ */
+/* ============================ 存储 ============================
+ * 分层约定(改代码前先读这三行):
+ *   [数据层] 本文件 —— 改 store 后调 save() 落盘。
+ *   [视图层] fe1/fe3/fe4/fe5 —— renderXxx() 只读 store, 不写。
+ *   [桥接]   updateAllUI('视图名'...) —— 数据层唯一允许的"通知 UI"手段。
+ *           请只传本次真正影响的视图; 传空 = 全量四页签(仅初始化/导入/清空/全量刷新用)。
+ *             todo 稍后再看   mon 监控   subs 订阅   dl 下载   pick 工作台选片
+ *           计数角标由 flushCounts() 每帧无条件刷新, 与标脏范围无关。 */
 const NS = 'BilibiliRSS';
 const DEFAULTS = {
-  ver: '0.4.0',
+  ver: '0.4.1',
   settings: {
     notify: true, dlQn: 127, dlDanmu: true,
     /* v0.3.1 下载形态开关 */
@@ -792,7 +799,9 @@ function itemsFromView(view, subId, kws, exkws, seenSet) {
   return out;
 }
 
-/* ============================ 引擎 ============================ */
+/* ============================ 订阅引擎 ============================
+ * 去重集 / 全历史关键词匹配 / 各类订阅(UP·合集·UGC·番剧)的增量刷新 /
+ * 订阅的增删改与条目状态流转。下载相关见下方「下载引擎 v2」。 */
 const dedupeSet = new Set();
 function rebuildDedupe() { dedupeSet.clear(); (store.items || []).forEach(i => dedupeSet.add(i.key)); (store.dedupe || []).forEach(k => dedupeSet.add(k)); }
 
@@ -980,17 +989,6 @@ function subSig(type, idPart, kws, exkws) {
 function subsOfUp(mid) {
   return (store.subs || []).filter(s => s.type === 'up' && String(s.mid) === String(mid));
 }
-/* 订阅卡片副标题: 同 UP 多条订阅时带上关键词, 便于一眼区分是哪一条 */
-function subTextOf(sub) {
-  const base = sub.subText || (sub.type === 'up' ? 'UP 投稿' : '订阅');
-  const kw = (sub.kws || []).filter(Boolean);
-  const ex = (sub.exkws || []).filter(Boolean);
-  if (!kw.length && !ex.length) return base;
-  let t = kw.length ? kw.join('+') : '全部';
-  if (ex.length) t += ' 排除' + ex.join('/');
-  return base + ' · ' + t;
-}
-
 /* 添加订阅(订阅即导入当前全部内容, 之后刷新只补新增)。
  * 关键词: kws=匹配(全部命中即收 AND), exkws=排除(命中即丢); 空=不过滤 */
 async function addSubscription(input, kws = [], opt = {}) {
@@ -1139,9 +1137,8 @@ function delSub(id) {
   store.subs = store.subs.filter(s => s.id !== id);
   store.items = store.items.filter(i => i.subId !== id || i.st === 'done');
   save(); rebuildDedupe();
-  updateAllUI();
+  updateAllUI('subs', 'todo');
 }
-function toggleSub(id) { const s = store.subs.find(x => x.id === id); if (s) { s.on = !s.on; save(); updateAllUI(); } }
 /* 编辑订阅筛选规则。
  * UP 订阅要额外做一次去重: 改后的关键词组合若与该 UP 的另一条订阅撞车,
  * 会导致两条订阅筛选完全相同 —— 拒绝并保持原值, 由返回值告知调用方。 */
@@ -1156,22 +1153,15 @@ function editSub(id, kwRaw, exRaw) {
   }
   s.kws = kws;
   s.exkws = exkws;
-  save(); updateAllUI();
+  save(); updateAllUI('subs', 'todo');
   return { ok: true };
 }
 
-/* 状态机:todo/done/ignored。删除时进 dedupe(下次刷新不再入) */
-function setItemStatus(itemId, st) {
-  const i = store.items.find(x => x.id === itemId); if (!i) return;
-  i.st = st;
-  if (st === 'ignored') { store.ignore = Array.from(new Set([...(store.ignore || []), i.key])); }
-  save(); rebuildDedupe(); updateAllUI();
-}
 function deleteItem(itemId) {
   const i = store.items.find(x => x.id === itemId); if (!i) return;
   store.dedupe = Array.from(new Set([...(store.dedupe || []), i.key]));
   store.items = store.items.filter(x => x.id !== itemId);
-  save(); rebuildDedupe(); updateAllUI();
+  save(); rebuildDedupe(); updateAllUI('todo');
 }
 /* ============================ 监控引擎 ============================ */
 async function refreshMonUp(m) {
@@ -1217,7 +1207,7 @@ async function refreshAllMons() {
 }
 async function refreshMonById(id) {
   const m = store.mons.find(x => x.id === id); if (!m) return;
-  try { await refreshMon(m); save(); updateAllUI(); toast('已刷新'); }
+  try { await refreshMon(m); save(); updateAllUI('mon'); toast('已刷新'); }
   catch (e) { toast('刷新失败: ' + (e && e.message || e)); }
 }
 /* 加入监控; 返回 { ok, id, dup, msg }。id 供入口立即刷新该条 */
@@ -1238,7 +1228,7 @@ function addMon(input) {
   }
   save(); return { ok: true, id };
 }
-function delMon(id) { store.mons = store.mons.filter(x => x.id !== id); save(); updateAllUI(); }
+function delMon(id) { store.mons = store.mons.filter(x => x.id !== id); save(); updateAllUI('mon'); }
 
 /* ============================ 下载引擎 v2 ============================
  * 1) durl 直链(fnval=1, ≤720P) → GM_download 直接落盘 {标题}.mp4
@@ -1246,7 +1236,6 @@ function delMon(id) { store.mons = store.mons.filter(x => x.id !== id); save(); 
  *    GM_xmlhttpRequest(带 Referer/UA, 等价扩展级请求可跨域 206) 拉取分片,
  *    字节传页内 ffmpeg.wasm -c copy 合并 → <a download> {标题}.mp4
  * 3) DASH 不可用则回落 durl。全程无需登录也能拿 720P 直链。 */
-const QN_TIERS = [127, 120, 116, 112, 108, 80, 74, 64, 32, 16];
 const QN_LABEL = { 127: '原画', 120: '4K', 116: '1080P60', 112: '1080P+', 108: '1080P60', 80: '1080P', 74: '720P60', 64: '720P', 32: '480P', 16: '360P' };
 /* 音轨 id → 档位名(30280=192K/30232=132K/30216=64K; 30250/30251 为杜比/无损) */
 const AUDIO_QN_LABEL = { 30280: '192K', 30232: '132K', 30216: '64K', 30251: '无损', 30250: '杜比全景声' };
@@ -1336,11 +1325,6 @@ function probeRange(url, referer) {
       ontimeout: () => done(false, 0, '探测超时')
     });
   });
-}
-/* 兼容旧调用点: 只要总长 */
-async function gmxRangeLen(url, referer) {
-  const p = await probeRange(url, referer);
-  return p.ok ? p.total : 0;
 }
 /* 单个 Range 分块: 停滞看门狗 + 退避重试。
  * 非 206 抛错(交给上层降并发/回退); 4xx 里除 408/429 外重试没有意义, 直接放弃。 */
@@ -1938,7 +1922,7 @@ async function ensureCid(bvid, pid = 1) {
 let dlUiT = null;
 function uiThrottle() {
   if (dlUiT) return;
-  dlUiT = setTimeout(() => { dlUiT = null; updateAllUI(); }, 160);
+  dlUiT = setTimeout(() => { dlUiT = null; updateAllUI('dl'); }, 160);
 }
 
 async function dlTick() {
@@ -1946,7 +1930,7 @@ async function dlTick() {
   if (doing) return;
   const next = store.dls.find(d => d.st === 'queue');
   if (!next) return;
-  next.st = 'doing'; next.prog = 0.02; next.startedAt = Date.now(); next.sub = '获取播放地址…'; save(); updateAllUI();
+  next.st = 'doing'; next.prog = 0.02; next.startedAt = Date.now(); next.sub = '获取播放地址…'; save(); updateAllUI('dl');
   try {
     let cid = next.cid;
     if (!cid) {
@@ -1965,7 +1949,7 @@ async function dlTick() {
     /* 文件名随形态变: 仅音频 → .m4a; 其余 → .mp4(分离模式会由基名派生两个文件) */
     const base = sanitizeName(next.title || next.bvid || ('EP' + next.epId));
     next.path = audioOnly ? (base + '.m4a') : (base + '.mp4');
-    save(); updateAllUI();
+    save(); updateAllUI('dl');
 
     /* ---- 仅下载音频: 只拉音轨存 .m4a, 不碰 ffmpeg ---- */
     if (plan.mode === 'audio') {
@@ -1981,7 +1965,7 @@ async function dlTick() {
       next.size = ab.byteLength || 0;
       next.format = '仅音频 ' + (AUDIO_QN_LABEL[plan.quality] || ('a' + plan.quality));
       next.prog = 1; next.st = 'done'; next.doneAt = Date.now();
-      save(); updateAllUI();
+      save(); updateAllUI('dl');
       saveBlob(ab, next.path, 'audio/mp4');
       toast('已保存音频: ' + next.path);
       dlTick();
@@ -1992,7 +1976,7 @@ async function dlTick() {
     if (plan.mode === 'durl') {
       next.size = plan.durl.size || 0;
       next.format = '直链 ' + (QN_LABEL[plan.quality] || ('qn' + plan.quality));
-      next.sub = '浏览器下载中(交给系统下载)…'; next.prog = 0.5; save(); updateAllUI();
+      next.sub = '浏览器下载中(交给系统下载)…'; next.prog = 0.5; save(); updateAllUI('dl');
       if (typeof GM_download !== 'function') throw new Error('GM_download 不可用');
       GM_download({
         url: plan.durl.url,
@@ -2001,9 +1985,9 @@ async function dlTick() {
           Referer: next.epId ? bgReferer(next.bgSsid || '', next.epId) : 'https://www.bilibili.com/',
           'User-Agent': navigator.userAgent
         },
-        onload: () => { next.prog = 1; next.st = 'done'; next.doneAt = Date.now(); save(); updateAllUI(); toast('下载完成: ' + next.path); dlTick(); afterDownloaded(next); },
-        onerror: (err) => { next.st = 'err'; next.err = String(err?.error || err?.message || err || '未知错误'); save(); updateAllUI(); toast('下载失败: ' + shortErr(next.err)); dlTick(); },
-        ontimeout: () => { next.st = 'err'; next.err = 'timeout'; save(); updateAllUI(); dlTick(); }
+        onload: () => { next.prog = 1; next.st = 'done'; next.doneAt = Date.now(); save(); updateAllUI('dl'); toast('下载完成: ' + next.path); dlTick(); afterDownloaded(next); },
+        onerror: (err) => { next.st = 'err'; next.err = String(err?.error || err?.message || err || '未知错误'); save(); updateAllUI('dl'); toast('下载失败: ' + shortErr(next.err)); dlTick(); },
+        ontimeout: () => { next.st = 'err'; next.err = 'timeout'; save(); updateAllUI('dl'); dlTick(); }
       });
       return;
     }
@@ -2034,7 +2018,7 @@ async function dlTick() {
       next.path = stem;
       next.format = 'DASH ' + (QN_LABEL[plan.quality] || ('qn' + plan.quality)) + ' 分离';
       next.prog = 1; next.st = 'done'; next.doneAt = Date.now();
-      save(); updateAllUI();
+      save(); updateAllUI('dl');
       saveBlob(vparts, stem + '.video.m4s', 'video/mp4');   /* 分块数组零拷贝落盘 */
       /* 两次落盘之间留一点间隔: 连续触发下载容易被浏览器当作批量下载拦下 */
       setTimeout(() => {
@@ -2052,7 +2036,7 @@ async function dlTick() {
     const vb = joinParts(vparts);
     /* B 站 playurl 的 timelength 是毫秒; ffMerge 内基于此算 time= 行 → 百分比 */
     const durMs = Number(plan.timelength) || 0;
-    next.sub = 'ffmpeg 合并中…'; save(); updateAllUI();
+    next.sub = 'ffmpeg 合并中…'; save(); updateAllUI('dl');
     try {
       const merged = await ffMerge(vb, ab, durMs, (r, tMs) => {
         next.prog = r;
@@ -2068,14 +2052,14 @@ async function dlTick() {
       });
       next.size = merged.byteLength || next.size;
       next.prog = 1; next.st = 'done'; next.doneAt = Date.now();
-      save(); updateAllUI();
+      save(); updateAllUI('dl');
       saveBlob(merged, next.path);
       toast('已合并并开始下载: ' + next.path);
       dlTick();
       afterDownloaded(next);
     } catch (e) {
       next.st = 'err'; next.err = e.message || String(e);
-      save(); updateAllUI(); toast('合并失败: ' + shortErr(next.err));
+      save(); updateAllUI('dl'); toast('合并失败: ' + shortErr(next.err));
       dlTick();
     }
   } catch (e) {
@@ -2083,7 +2067,7 @@ async function dlTick() {
     /* 业务性错误(大会员/付费/地区/未提供音轨)重试没有意义, 直接判死 */
     if (/需大会员|付费|地区限制|缺少 cid|需登录|未提供/.test(msg)) {
       next.rPlan = 0; next.rMedia = 0;
-      next.st = 'err'; next.err = msg; save(); updateAllUI();
+      next.st = 'err'; next.err = msg; save(); updateAllUI('dl');
       toast('下载失败: ' + shortErr(next.err));
       dlTick();
       return;
@@ -2092,7 +2076,7 @@ async function dlTick() {
     if (!next.planDone && (next.rPlan || 0) < 3) {
       next.rPlan = (next.rPlan || 0) + 1;
       next.st = 'queue'; next.prog = 0; next.sub = '网络不佳, 自动重试 ' + next.rPlan + '/3';
-      next.err = msg; save(); updateAllUI();
+      next.err = msg; save(); updateAllUI('dl');
       toast('网络不佳, 自动重试 ' + next.rPlan + '/3: ' + shortErr(msg));
       setTimeout(dlTick, 1500 * next.rPlan);   /* 退避, 别立刻再撞一次 */
       return;
@@ -2106,13 +2090,13 @@ async function dlTick() {
       next.rPlan = 0; next.planDone = false;
       next.st = 'queue'; next.prog = 0;
       next.sub = '下载中断, 重新取地址重试 ' + next.rMedia + '/2';
-      next.err = msg; save(); updateAllUI();
+      next.err = msg; save(); updateAllUI('dl');
       toast('下载中断, 自动重试 ' + next.rMedia + '/2: ' + shortErr(msg));
       setTimeout(dlTick, 3000 * next.rMedia);
       return;
     }
     next.rPlan = 0; next.rMedia = 0;
-    next.st = 'err'; next.err = msg; save(); updateAllUI();
+    next.st = 'err'; next.err = msg; save(); updateAllUI('dl');
     toast('下载失败: ' + shortErr(next.err));
     dlTick();
   }
@@ -2195,15 +2179,15 @@ function startDownload(input) {
     st: 'queue'
   };
   if (epId) { task.epId = epId; task.bgSsid = String(input.bgSsid || ''); }
-  store.dls.unshift(task); save(); updateAllUI(); dlTick();
+  store.dls.unshift(task); save(); updateAllUI('dl'); dlTick();
   warmFF();   /* 加入下载即自动预载引擎(高画质才拉核心, 合并时不再等待) */
   return task;
 }
-function delDl(id) { store.dls = store.dls.filter(d => d.id !== id); save(); updateAllUI(); }
+function delDl(id) { store.dls = store.dls.filter(d => d.id !== id); save(); updateAllUI('dl'); }
 function retryDl(id) {
   const d = store.dls.find(x => x.id === id); if (!d) return;
   d.st = 'queue'; d.err = ''; d.sub = ''; d.doneAt = 0; d.quality = 0; d.format = ''; d.size = 0;
-  save(); updateAllUI(); toast('已重新加入下载队列'); dlTick();
+  save(); updateAllUI('dl'); toast('已重新加入下载队列'); dlTick();
 }
 /* =========================================================================
  * BilibiliRSS · 前端 v3 —— 用户友好 / 高性能 / 快速响应
@@ -2310,21 +2294,26 @@ const V = {
 const dirtySet = new Set();
 let rafHandle = 0;
 function markDirty(...views) { views.forEach(v => dirtySet.add(v)); scheduleRender(); }
+/* 页签 → 渲染函数。页签互斥, 只需跑当前这一个 (旧写法是 5 个 if 逐个比对)。
+ * 'set' 页签无需重绘, 故不在此表。 */
+const TAB_VIEW = { todo: 'todo', mon: 'mon', subs: 'subs', bench: 'pick', dl: 'dl' };
+const VIEW_RENDER = { todo: () => renderTodo(), mon: () => renderMon(), subs: () => renderSubs(), pick: () => renderDlPick(), dl: () => renderDl() };
 function scheduleRender() {
   if (rafHandle) return;
   rafHandle = (typeof requestAnimationFrame === 'function' ? requestAnimationFrame : (cb => setTimeout(cb, 16)))(() => {
     rafHandle = 0;
     const views = new Set(dirtySet); dirtySet.clear();
-    flushCounts();
-    if (V.tab === 'todo' && views.has('todo')) renderTodo();
-    if (V.tab === 'mon' && views.has('mon')) renderMon();
-    if (V.tab === 'subs' && views.has('subs')) renderSubs();
-    if (V.tab === 'bench' && views.has('pick')) renderDlPick();
-    if (V.tab === 'dl' && views.has('dl')) renderDl();
+    flushCounts();   /* 计数角标与页签无关, 每次合帧都要刷新 */
+    const key = TAB_VIEW[V.tab];
+    if (key && views.has(key)) { const fn = VIEW_RENDER[key]; if (fn) fn(); }
   });
 }
-/* 后端统一入口（契约） */
-function updateAllUI() { if (!shadowRoot) return; markDirty('todo', 'mon', 'subs', 'dl'); }
+/* 后端统一入口（契约）: 不带参 = 全量标脏; 传视图名 = 只标这些视图。
+ * 只标脏不重绘 —— 真正渲染由 scheduleRender 按当前页签取舍, 未打开的页签不白算。 */
+function updateAllUI(...views) {
+  if (!shadowRoot) return;
+  markDirty.apply(null, views.length ? views : ['todo', 'mon', 'subs', 'dl']);
+}
 
 /* ---------------------- 小工具 ---------------------- */
 const relTime = ts => { const t = Number(ts) || 0; return t ? fmtDate(Math.floor(t / 1000)) : '—'; };
@@ -4227,7 +4216,6 @@ function detectPagePick() {
        * 不阻塞主卡渲染 —— 先出主卡, 合集卡就绪后追加。 */
       const seasonCard = () => {
         const mk = sg => {
-          const encName = encodeURIComponent(sg.name || '');
           return '<div class="dlpick" data-kind="season" data-mid="' + attr(sg.mid) + '" data-sid="' + attr(sg.seasonId) + '">' +
             pickHead('视频所属合集') +
             '<div class="dlp-body">' +
@@ -4617,7 +4605,7 @@ async function bgFinishSub(sub) {
   try {
     const r = await refreshSub(sub, { full: true });
     const added = (r && r.added) || 0;
-    save(); rebuildDedupe(); updateAllUI();
+    save(); rebuildDedupe(); updateAllUI('subs','todo');
     if (added) toast('已导入 ' + added + ' 条到稍后再看');
   } catch (e) { console.warn('[BilibiliRSS] bg refresh', sub && sub.id, e); }
 }
@@ -4646,15 +4634,15 @@ async function subscribeUp(mid, upName, opt = {}) {
   toast('订阅中…');
   const r = await addSubscription(String(mid), kw.kws, { exkws: kw.exkws, noBackfill: true });
   if (r.ok && r.sub) {
-    updateAllUI();
+    updateAllUI('subs','todo');
     toast('已订阅「' + (r.sub.name || upName || mid) + '」' +
       (kw.kws.length ? '(关键词 ' + kw.kws.join('、') + ')' : '') + '，后台抓取中…');
     bgFinishSub(r.sub);
   } else if (r.dup && r.sub) {
-    updateAllUI(); toast(r.msg || '该 UP 已在订阅');
+    updateAllUI('subs','todo'); toast(r.msg || '该 UP 已在订阅');
     bgFinishSub(r.sub);
   } else {
-    updateAllUI(); toast(r.msg || '订阅失败');
+    updateAllUI('subs','todo'); toast(r.msg || '订阅失败');
   }
   return true;
 }
@@ -4673,14 +4661,14 @@ async function subscribeSeasonNow() {
   toast('订阅中…');
   const r = await addSubscription(location.href, [], { noBackfill: true });
   if (r.ok && r.sub) {
-    updateAllUI();
+    updateAllUI('subs','todo');
     toast('已订阅' + kn + '「' + (r.sub.name || '') + '」，正在导入全部现有分P…');
     bgFinishSub(r.sub);
   } else if (r.dup && r.sub) {
-    updateAllUI(); toast('该' + kn + '已在订阅');
+    updateAllUI('subs','todo'); toast('该' + kn + '已在订阅');
     bgFinishSub(r.sub);
   } else {
-    updateAllUI(); toast(r.msg || '订阅失败');
+    updateAllUI('subs','todo'); toast(r.msg || '订阅失败');
   }
 }
 /* 用 mid + sid 直接订阅合集/专辑(不依赖当前页面 URL) —— 供视频页的合集卡使用 */
@@ -4697,14 +4685,14 @@ async function subscribeSeasonById(mid, sid, isSeries) {
   const link = 'https://space.bilibili.com/' + mid + '/lists/' + sid + (isSeries ? '?type=series' : '');
   const r = await addSubscription(link, [], { noBackfill: true });
   if (r.ok && r.sub) {
-    updateAllUI();
+    updateAllUI('subs','todo');
     toast('已订阅' + kn + '「' + (r.sub.name || '') + '」，正在导入全部视频…');
     bgFinishSub(r.sub);
   } else if (r.dup && r.sub) {
-    updateAllUI(); toast('该' + kn + '已在订阅');
+    updateAllUI('subs','todo'); toast('该' + kn + '已在订阅');
     bgFinishSub(r.sub);
   } else {
-    updateAllUI(); toast(r.msg || '订阅失败');
+    updateAllUI('subs','todo'); toast(r.msg || '订阅失败');
   }
 }
 /* 把当前视频加入稍后再看。
@@ -4739,7 +4727,7 @@ async function addCurrentToTodo(pick, D) {
   });
   if (!batch.length) { toast(skipped ? '已在稍后再看中（' + skipped + ' 条）' : '没有可加入的内容'); return; }
   store.items.unshift(...batch);
-  save(); rebuildDedupe(); updateAllUI();
+  save(); rebuildDedupe(); updateAllUI('subs','todo');
   toast('已加入稍后再看 ' + batch.length + ' 条' + (skipped ? '（跳过已在列表的 ' + skipped + ' 条）' : ''));
 }
 /* 订阅番剧(ss/ep 链接): 全部剧集一次导入(含 OP/ED/花絮各 section) */
@@ -4758,14 +4746,14 @@ async function subscribeBangumiNow(link) {
   toast('订阅中…');
   const r = await addSubscription(href, [], { noBackfill: true });
   if (r.ok && r.sub) {
-    updateAllUI();
+    updateAllUI('subs','todo');
     toast('已订阅番剧「' + (r.sub.name || '') + '」，正在导入全部剧集…');
     bgFinishSub(r.sub);
   } else if (r.dup && r.sub) {
-    updateAllUI(); toast('该番剧已在订阅');
+    updateAllUI('subs','todo'); toast('该番剧已在订阅');
     bgFinishSub(r.sub);
   } else {
-    updateAllUI(); toast(r.msg || '订阅失败');
+    updateAllUI('subs','todo'); toast(r.msg || '订阅失败');
   }
 }
 /* 监控点击后的通用收尾: 立即抓取该监控数据 */
