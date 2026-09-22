@@ -2,6 +2,19 @@
 
 本文件记录 BilibiliRSS 的版本变化。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.3.9] — 2026-09-22
+
+### 新增
+
+- **设置页加入「更新」按钮**：「BilibiliRSS」卡片（GitHub 链接旁）新增更新按钮，点开即到最新版脚本地址 —— 指向远端仓库的 **latest Release 产物**，所以不用随版本改地址。在油猴里覆盖安装即可升级。
+- **篡改猴自动更新**：脚本头部加入 `@updateURL` / `@downloadURL`，装上这一版之后，往后有新版本油猴会自己提示。
+
+### 说明
+
+- **更新地址默认挂国内镜像，但实测镜像并不加速**。本机实测（取 254835B 的脚本）：直连 github **176 KB/s** 最快；ghproxy.net 106 KB/s；ghfast.top 105 KB/s；jsdelivr 89 KB/s；gh-proxy.com 67 KB/s。12 个候选镜像里 **7 个已失效**（ghproxy.cc 证书过期、hub.gitmirror.com / raw.gitmirror 域名不存在、gh.llkk.cc / github.moeyy.xyz 超时、gitproxy.click 返回空响应、gcore.jsdelivr 连接重置）。
+  所以镜像的价值在于「github 打不开时的唯一出路」，不在于快。默认走 `ghproxy.net`；想换源只改一处常量 `GH_MIRROR`，设成 `''` 即走直连。实测数据与失效清单已作为注释留在代码里。
+- **⚠ 装过 0.3.8 的需要手动更新一次**：更新头是 v0.3.9 才加的，0.3.8 里没有，所以油猴不会主动提示。用设置页的「更新」按钮（或 GitHub Release 页）覆盖安装一次，之后才会走自动更新。
+
 ## [0.3.8] — 2026-09-22
 
 ### 修复

@@ -1,9 +1,11 @@
 // ==UserScript==
 // @name         BilibiliRSS
 // @namespace    https://github.com/xinbaji/BilibiliRSS
-// @version      0.3.8
+// @version      0.3.9
 // @description  B站稍后再看 · UP/合集/视频订阅追更 · 增量监控 · 下载(直链+DASH ffmpeg合并mp4)+弹幕XML（独立油猴版）
 // @author       xinbaji
+// @updateURL    https://ghproxy.net/https://github.com/xinbaji/BilibiliRSS/releases/latest/download/BilibiliRSS.user.js
+// @downloadURL  https://ghproxy.net/https://github.com/xinbaji/BilibiliRSS/releases/latest/download/BilibiliRSS.user.js
 // @match        https://www.bilibili.com/*
 // @match        https://space.bilibili.com/*
 // @grant        GM_setValue
@@ -147,7 +149,7 @@ function md5(str) {
 /* ============================ 存储 ============================ */
 const NS = 'BilibiliRSS';
 const DEFAULTS = {
-  ver: '0.3.8',
+  ver: '0.3.9',
   settings: {
     notify: true, dlQn: 127, dlDanmu: true,
     /* v0.3.1 下载形态开关 */
@@ -166,6 +168,23 @@ const DEFAULTS = {
   ignore: [],
   ui: { curStatus: 'todo', curSub: '' },   /* curSub: 订阅id(字符串); '' = 全部 */
 };
+
+/* ---------------- 更新地址 ----------------
+ * 指向「远端仓库 latest Release 的脚本产物」, 区别只在前面挂不挂国内镜像。
+ * 只改 GH_MIRROR 就能换源; 想直连就把它设成 ''。
+ * ⚠ 头部的 @updateURL / @downloadURL 是纯文本, 改这里不会同步过去, 要一起改。
+ *
+ * 实测(2026-09-22, 取 254835B 的 BilibiliRSS.user.js):
+ *   直连 github        176 KB/s  ← 最快, 但被墙时完全不可用
+ *   ghproxy.net        106 KB/s  ← 默认走这个
+ *   ghfast.top         105 KB/s  ← 备用
+ *   jsdelivr(cdn)       89 KB/s  只镜像仓库文件且有缓存延迟, 不适合做更新源
+ *   gh-proxy.com        67 KB/s
+ *   已失效: ghproxy.cc(证书过期) · hub.gitmirror.com / raw.gitmirror(域名不存在)
+ *           gh.llkk.cc · github.moeyy.xyz(超时) · gitproxy.click(空响应) · gcore.jsdelivr(连接重置) */
+const GH_MIRROR = 'https://ghproxy.net/';
+const REPO_URL = 'https://github.com/xinbaji/BilibiliRSS';
+const UPD_URL = GH_MIRROR + REPO_URL + '/releases/latest/download/BilibiliRSS.user.js';
 let store = null;
 
 function loadStore() {
@@ -2964,7 +2983,7 @@ const HTML = `
             <div style="flex:1;min-width:0">
               <div class="an">BilibiliRSS <span class="ver">v${DEFAULTS.ver}</span></div>
               <div class="av">作者 xinbaji · 数据仅存本地 · 前端 v3</div>
-              <div class="al"><a class="sbtn sm" style="text-decoration:none" href="https://github.com/xinbaji/BilibiliRSS" target="_blank" rel="noopener">${ICO.external}GitHub</a><span class="chip p">${ICO.zap}高性能渲染</span></div>
+              <div class="al"><a class="sbtn sm" style="text-decoration:none" href="${REPO_URL}" target="_blank" rel="noopener">${ICO.external}GitHub</a><a class="sbtn sm pink" style="text-decoration:none" id="brsBtnUpdate" href="${UPD_URL}" target="_blank" rel="noopener" title="打开最新版脚本地址（远端 latest Release，经 ghproxy.net 镜像）">${ICO.refresh}更新</a><span class="chip p">${ICO.zap}高性能渲染</span></div>
             </div>
           </div>
           <div style="height:8px"></div>
@@ -3197,6 +3216,12 @@ function bindUI() {
     avaCache = null; V.limit.todo = 60;
     rebuildDedupe(); updateAllUI(); renderAllNow(); toast('已清空全部数据');
   });
+
+  /* 更新按钮: <a target="_blank"> 自己会开新标签页, 这里只补一句提示。
+   * 链接指向「远端 latest Release 的脚本产物」, 前面挂了国内镜像(见 GH_MIRROR),
+   * 点开即下最新脚本, 在油猴里覆盖安装即可; 自动更新则靠头部的 @updateURL。 */
+  const updBtn = q('#brsBtnUpdate');
+  if (updBtn) updBtn.addEventListener('click', () => toast('已打开最新版脚本地址，覆盖安装即可'));
 
   /* 键盘快捷键 */
   document.addEventListener('keydown', ev => {
