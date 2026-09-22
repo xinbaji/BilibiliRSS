@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BilibiliRSS
 // @namespace    https://github.com/xinbaji/BilibiliRSS
-// @version      0.3.9
+// @version      0.4.0
 // @description  B站稍后再看 · UP/合集/视频订阅追更 · 增量监控 · 下载(直链+DASH ffmpeg合并mp4)+弹幕XML（独立油猴版）
 // @author       xinbaji
 // @updateURL    https://ghproxy.net/https://github.com/xinbaji/BilibiliRSS/releases/latest/download/BilibiliRSS.user.js
@@ -149,7 +149,7 @@ function md5(str) {
 /* ============================ 存储 ============================ */
 const NS = 'BilibiliRSS';
 const DEFAULTS = {
-  ver: '0.3.9',
+  ver: '0.4.0',
   settings: {
     notify: true, dlQn: 127, dlDanmu: true,
     /* v0.3.1 下载形态开关 */
@@ -1298,22 +1298,49 @@ function gmxArrayBuffer(url, onProg, referer) {
 /* ================= DASH 视频轨多线程下载 =================
  * CDN 实测(见 build/probe_range.js): bilivideo 对 Range 返回 206 + content-range 总长,
  * 8 并发分块全部 206 → 视频轨按字节分块并发拉, 音频轨保持单线程(体积小, 且省连接数)。
- * 任一环节不支持(无 206 / 分块失败重试耗尽) → 上层回退单线程 gmxArrayBuffer。 */
+ *
+ * 但「CDN 支持 Range」不是可以无条件相信的前提: 实测同一视频的候选镜像里常有
+ * mcdn.bilivideo.cn 之类的 P2P 节点, 对 Range 直接重置连接。所以下载全程分两层兜底,
+ * 详见 gmxVideoTrack 的注释。 */
 const DL_VIDEO_THREADS_DEF = 8;   /* 设置缺失时的默认值; 实际以 settings.dlThreads 为准 */
-/* 探测文件总长: Range 0-0 → content-range; 不支持返回 0 */
-function gmxRangeLen(url, referer) {
+
+/* CDN 不接受 Range 时抛这个错。
+ * 用自定义名字而不是错文字符串, 是为了让上游能靠 err.name 精确识别 ——
+ * 错误文案以后要改也不会把「回退单线程」这条分支改坏(之前用正则匹配中文文案, 脆)。 */
+function noRangeErr(detail) {
+  const e = new Error('CDN 不支持 Range' + (detail ? '(' + detail + ')' : ''));
+  e.name = 'NoRangeError';
+  e.noRange = true;
+  return e;
+}
+const isNoRange = e => !!(e && (e.noRange || e.name === 'NoRangeError'));
+/* 探测: Range 0-0 → 既要 206, 也要 content-range 里的总长。
+ * 两者缺一都判定「这个 CDN 不吃 Range」; 有总长才能算分块边界。
+ * 返回 { total, ok, reason }, 把「为什么不支持」一并带出来便于日志定位。 */
+function probeRange(url, referer) {
   return new Promise((res) => {
+    const done = (ok, total, reason) => res({ ok: !!ok, total: total || 0, reason: reason || '' });
     GM_xmlhttpRequest({
       method: 'GET', url, responseType: 'arraybuffer', timeout: 120000,
       headers: { Referer: referer || 'https://www.bilibili.com/', 'User-Agent': navigator.userAgent, Range: 'bytes=0-0' },
       onload: r => {
-        if (r.status !== 206) return res(0);
+        if (r.status !== 206) return done(false, 0, 'HTTP ' + r.status);
         const m = /content-range:\s*bytes\s+\d+-\d+\/(\d+)/i.exec(r.responseHeaders || '');
-        res(m ? Number(m[1]) : 0);
+        if (!m) return done(false, 0, '无 content-range');
+        const total = Number(m[1]);
+        if (!total) return done(false, 0, '总长为 0');
+        done(true, total);
       },
-      onerror: () => res(0), ontimeout: () => res(0)
+      /* 探测本身失败(网络抖动)不算「不支持 Range」, 交给重试; 这里只回一个可重试的失败态 */
+      onerror: () => done(false, 0, '探测网络错误'),
+      ontimeout: () => done(false, 0, '探测超时')
     });
   });
+}
+/* 兼容旧调用点: 只要总长 */
+async function gmxRangeLen(url, referer) {
+  const p = await probeRange(url, referer);
+  return p.ok ? p.total : 0;
 }
 /* 单个 Range 分块: 停滞看门狗 + 退避重试。
  * 非 206 抛错(交给上层降并发/回退); 4xx 里除 408/429 外重试没有意义, 直接放弃。 */
@@ -1365,8 +1392,9 @@ function gmxChunk(url, start, end, referer, onProg, tries, reg) {
 /* 视频轨多线程: 返回按序分块数组 ArrayBuffer[](落盘零拷贝; 合并路径用 joinParts 拼回)
  * maxThreads: 覆盖用户设置, 供「降并发重试」逐级调低; 不传则用 settings.dlThreads */
 async function gmxVideoParts(url, onProg, referer, maxThreads) {
-  const total = await gmxRangeLen(url, referer);
-  if (!total) throw new Error('CDN 不支持 Range');
+  const p = await probeRange(url, referer);
+  if (!p.ok) throw noRangeErr(p.reason);
+  const total = p.total;
   const userThreads = Number(maxThreads) || Number(getSet().dlThreads) || DL_VIDEO_THREADS_DEF;
   /* 每连接至少 4MiB 才开班: 纯 2~4MiB 的小视频即使设了 16 线程也不会真的开 16 条连接
    * (小文件多连接纯属浪费, 且更容易触发 CDN 限速) */
@@ -1395,29 +1423,81 @@ async function gmxVideoParts(url, onProg, referer, maxThreads) {
     throw e;
   }
 }
-/* 拉视频轨: 先按用户线程数多线程, 失败则逐级降并发重试, 最后才回退单线程。
+/* 拉视频轨, 两层兜底:
  *
- * 为什么不一步回退单线程: 多数失败是并发太高被 CDN 限流, 8 条降到 4 条往往就通了;
- * 直接退回单线程等于把速度砍到 1/8, 还白扔掉已经下好的分块。 */
-async function gmxVideoTrack(url, onProg, referer) {
+ *   外层 = 换镜像。B 站每条轨给 1 个 baseUrl + 若干 backupUrl, 其中 baseUrl 常是
+ *          P2P 节点(mcdn.bilivideo.cn 等), 实测大量直接 ECONNRESET。只下 baseUrl
+ *          等于把成败压在运气上 —— 所以逐个镜像试, 哪个通用哪个。
+ *   内层 = 降并发。同一个镜像上, 失败多半是被限流, 8 条降到 4 条往往就通了;
+ *          直接退回单线程等于把速度砍到 1/8, 还白扔掉已经下好的分块。
+ *
+ * 特例: 某个镜像「不吃 Range」时, 它跟并发度无关, 降档纯白等 —— 但仍值得
+ * 用它走一次单线程(单线程不需要 Range), 而不是直接放弃这个镜像。
+ * 所以 Range 不支持 → 跳过该镜像的并发梯子, 就地转单线程。
+ *
+ * 兼容旧调用: 传字符串也可以, 内部包成单元素数组。 */
+async function gmxVideoTrack(urls, onProg, referer) {
+  const list = (Array.isArray(urls) ? urls : [urls]).filter(Boolean);
+  if (!list.length) throw new Error('没有可用的视频轨地址');
+
   let top = Number(getSet().dlThreads) || DL_VIDEO_THREADS_DEF;
   top = Math.max(2, Math.min(top, 16));
   const ladder = [];
   for (let t = top; t >= 2; t = Math.floor(t / 2)) ladder.push(t);
+
   let last = null;
-  for (let i = 0; i < ladder.length; i++) {
+  for (let m = 0; m < list.length; m++) {
+    const url = list[m];
+    let host = url;
+    try { host = new URL(url).hostname; } catch (e) {}
+    /* 该镜像的并发梯子; noRange=true 时梯子只留第一档, 试完立刻转单线程 */
+    for (let i = 0; i < ladder.length; i++) {
+      try {
+        if (i) console.warn('[BilibiliRSS] 视频轨降至 ' + ladder[i] + ' 线程重试 (' + host + ')');
+        return await gmxVideoParts(url, onProg, referer, ladder[i]);
+      } catch (e) {
+        last = e;
+        /* 文件过小不值得开班 → 这个镜像直接走单线程 */
+        if (!isNoRange(e) && /文件过小/.test((e && e.message) || '')) break;
+        /* 不吃 Range → 本镜像的并发梯子没有意义, 立刻跳出转单线程 */
+        if (isNoRange(e)) {
+          console.warn('[BilibiliRSS] ' + host + ' 不支持 Range, 转单线程');
+          break;
+        }
+        if (i < ladder.length - 1) await sleep(600 * (i + 1));
+      }
+    }
+    /* 这个镜像的并发路线全废了: 先试单线程(不需要 Range), 成了就收工 */
     try {
-      if (i) console.warn('[BilibiliRSS] 视频轨降至 ' + ladder[i] + ' 线程重试');
-      return await gmxVideoParts(url, onProg, referer, ladder[i]);
+      console.warn('[BilibiliRSS] 视频轨回退单线程 (' + host + '):', (last && last.message) || last);
+      return [await gmxArrayBuffer(url, onProg, referer)];
     } catch (e) {
       last = e;
-      /* 地址本身就不支持 Range, 降并发也救不回来, 直接回退 */
-      if (/不支持 Range|文件过小/.test((e && e.message) || '')) throw e;
-      if (i < ladder.length - 1) await sleep(600 * (i + 1));
+      if (m < list.length - 1) {
+        console.warn('[BilibiliRSS] 镜像 ' + host + ' 不可用, 换下一个 (' + (m + 2) + '/' + list.length + ')');
+        await sleep(300);
+      }
     }
   }
-  console.warn('[BilibiliRSS] 视频轨多线程回退单线程:', (last && last.message) || last);
-  return [await gmxArrayBuffer(url, onProg, referer)];
+  throw last || new Error('视频轨下载失败');
+}
+/* 单线程下载 + 镜像兜底(音频轨用; 视频轨的最后一步也走这个思路)。
+ * 音轨体积小, 不值得开班并发; 但同样可能命中坏节点, 所以逐个镜像试,
+ * 不用管 Range —— 完整 GET 本来就不需要 Range。 */
+async function gmxOne(urls, onProg, referer) {
+  const list = (Array.isArray(urls) ? urls : [urls]).filter(Boolean);
+  if (!list.length) throw new Error('没有可用的音轨地址');
+  let last = null;
+  for (let i = 0; i < list.length; i++) {
+    try {
+      if (i) console.warn('[BilibiliRSS] 音轨换镜像重试 (' + (i + 1) + '/' + list.length + ')');
+      return await gmxArrayBuffer(list[i], onProg, referer);
+    } catch (e) {
+      last = e;
+      if (i < list.length - 1) await sleep(300);
+    }
+  }
+  throw last || new Error('音轨下载失败');
 }
 /* 按序拼接分块(合并路径需要连续 buffer 交给 ffmpeg) */
 function joinParts(parts) {
@@ -1709,6 +1789,19 @@ function pickDashTracks(resp, want, audioWant) {
   if (!video || !audio) return null;
   return { video, audio, quality: Number(video.id) || target, realTop };
 }
+/* 一条 DASH 轨的全部候选地址, 按可用性排序:
+ * baseUrl 只是「首选」而不是「唯一」—— B 站常把 baseUrl 给成 P2P 节点
+ * (mcdn.bilivideo.cn / 各类 edge.* 三方域名), 实测这类节点大量直接 ECONNRESET,
+ * 而真正可用的 upos 节点就躺在 backupUrl 里。只认 baseUrl 等于开局就压注在最差的一条上。
+ * 去重(同一地址可能同时出现在 baseUrl 与 backupUrl), 顺序保留 baseUrl 优先。 */
+function trackUrls(track) {
+  const out = [];
+  const push = u => { if (u && typeof u === 'string' && out.indexOf(u) < 0) out.push(u); };
+  push(track && (track.baseUrl || track.base_url));
+  const bks = (track && (track.backupUrl || track.backup_url)) || [];
+  for (const u of bks) push(u);
+  return out;
+}
 
 async function resolveStream(bvid, cid, wantQn, opt = {}) {
   const want = Number(wantQn) || 127;
@@ -1879,7 +1972,7 @@ async function dlTick() {
       const aRef = next.epId ? bgReferer(next.bgSsid || '', next.epId) : '';
       let aDone = 0, aTotal = 0;
       const mb1 = b => (b / 1048576).toFixed(0) + 'MB';
-      const ab = await gmxArrayBuffer(plan.audio.baseUrl, (l, t) => {
+      const ab = await gmxOne(trackUrls(plan.audio), (l, t) => {
         aDone = l; aTotal = t || aTotal;
         next.prog = 0.05 + (aTotal ? aDone / aTotal : 0) * 0.8;
         next.sub = '下载音轨 ' + mb1(aDone) + (aTotal ? '/' + mb1(aTotal) : '') + '…';
@@ -1927,9 +2020,10 @@ async function dlTick() {
     };
     const dlRef = next.epId ? bgReferer(next.bgSsid || '', next.epId) : '';
     const [vparts, ab] = await Promise.all([
-      /* 视频轨: 多线程 → 逐级降并发 → 单线程, 兜底逻辑全在 gmxVideoTrack 里 */
-      gmxVideoTrack(plan.video.baseUrl, (l, t) => { vDone = l; vTotal = t || vTotal; updSub(); }, dlRef),
-      gmxArrayBuffer(plan.audio.baseUrl, (l, t) => { aDone = l; aTotal = t || aTotal; updSub(); }, dlRef)
+      /* 视频轨: 逐镜像试 → 每镜像多线程 → 降并发 → 单线程, 兜底逻辑全在 gmxVideoTrack 里 */
+      gmxVideoTrack(trackUrls(plan.video), (l, t) => { vDone = l; vTotal = t || vTotal; updSub(); }, dlRef),
+      /* 音频轨: 体积小, 单线程即可; 同样支持镜像兜底(换到能通的节点) */
+      gmxOne(trackUrls(plan.audio), (l, t) => { aDone = l; aTotal = t || aTotal; updSub(); }, dlRef)
     ]);
     const vLen = vparts.reduce((a, b) => a + (b.byteLength || 0), 0);
     next.size = vLen + (ab.byteLength || 0);
