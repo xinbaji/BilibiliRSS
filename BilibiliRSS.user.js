@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BilibiliRSS
 // @namespace    https://github.com/xinbaji/BilibiliRSS
-// @version      0.4.1
+// @version      0.4.2
 // @description  B站稍后再看 · UP/合集/视频订阅追更 · 增量监控 · 下载(直链+DASH ffmpeg合并mp4)+弹幕XML（独立油猴版）
 // @author       xinbaji
 // @updateURL    https://ghproxy.net/https://github.com/xinbaji/BilibiliRSS/releases/latest/download/BilibiliRSS.user.js
@@ -156,7 +156,7 @@ function md5(str) {
  *           计数角标由 flushCounts() 每帧无条件刷新, 与标脏范围无关。 */
 const NS = 'BilibiliRSS';
 const DEFAULTS = {
-  ver: '0.4.1',
+  ver: '0.4.2',
   settings: {
     notify: true, dlQn: 127, dlDanmu: true,
     /* v0.3.1 下载形态开关 */
@@ -210,6 +210,8 @@ function loadStore() {
   if (!Array.isArray(store.ignore)) store.ignore = [];
   store.ui = { ...DEFAULTS.ui, ...(store.ui || {}) };
   if (store.ui.curSub && typeof store.ui.curSub === 'number') store.ui.curSub = '';   /* 旧数据兜底 */
+  /* v0.4.2: 订阅不再有「停用」态 —— 旧数据里 on=false 的一律拉回启用 */
+  store.subs.forEach(s => { if (s) s.on = true; });
 }
 let saveTimer = null;
 function save() {
@@ -833,11 +835,13 @@ async function refreshUp(sub, opt = {}) {
   if (kws.length) {
     /* 全历史搜索(订阅/手动) 或 轻量单页最新 50 条(日常自动刷新) */
     vlist = opt.full ? await upFullMatches(sub) : await fetchUpVideos(sub.mid, 50);
-    items = itemsFromUpVideos(vlist, sub.id, sub.kws || [], sub.exkws || [], ks);
   } else {
-    vlist = await fetchUpVideos(sub.mid, 50);
-    items = itemsFromUpVideos(vlist, sub.id, sub.kws || [], sub.exkws || [], ks);
+    /* 关键词为空 = 不想全量收这个 UP 的旧稿 → 只拿最新 5 条, 避免一订阅
+     * 就把历史投稿(最多 50 条)全灌进稍后再看。之后新投稿会陆续进入这 5 条窗口。 */
+    const all = await fetchUpVideos(sub.mid, 50);
+    vlist = all.slice(0, 5);
   }
+  items = itemsFromUpVideos(vlist, sub.id, sub.kws || [], sub.exkws || [], ks);
   repairUpDurations(vlist);
   store.items.unshift(...items);
   if (items.length) save();
@@ -921,7 +925,7 @@ async function refreshBangumi(sub) {
 const subRefreshing = new Set();
 let subFailTold = {};   /* 订阅刷新失败 toast 节流: subId -> ts */
 async function refreshSub(sub, opt = {}) {
-  if (!sub.on) return { added: 0 };
+  /* v0.4.2: 取消「启用 / 停用」，订阅不再有停用态（删掉订阅才能移除） */
   const k = sub.id || sub.bvid || sub.mid || sub.ssid;
   if (subRefreshing.has(k)) return { added: 0 };
   subRefreshing.add(k);
@@ -989,6 +993,18 @@ function subSig(type, idPart, kws, exkws) {
 function subsOfUp(mid) {
   return (store.subs || []).filter(s => s.type === 'up' && String(s.mid) === String(mid));
 }
+/* 订阅分类标签（v0.4.2）—— 只用于「订阅管理」上方的分类切换与列表角标,
+ * 不参与抓取逻辑(抓取仍按 s.type 分派)。用户可在编辑里手工改;
+ * 没设过 cat 的旧订阅按类型给一个合理默认: 番剧 → 番剧, 系列专辑 → 专辑, 其余 → UP 投稿。 */
+const SUB_CATS = [['up', 'UP 投稿'], ['bangumi', '番剧'], ['album', '专辑']];
+const catLabel = c => (SUB_CATS.find(x => x[0] === c) || SUB_CATS[0])[1];
+const catOf = s => {
+  if (s && SUB_CATS.some(x => x[0] === s.cat)) return s.cat;
+  const t = (s && s.type) || 'up';
+  if (t === 'bangumi') return 'bangumi';
+  if (t === 'season' && s.isSeries) return 'album';
+  return 'up';
+};
 /* 添加订阅(订阅即导入当前全部内容, 之后刷新只补新增)。
  * 关键词: kws=匹配(全部命中即收 AND), exkws=排除(命中即丢); 空=不过滤 */
 async function addSubscription(input, kws = [], opt = {}) {
@@ -1073,7 +1089,7 @@ async function addSubscription(input, kws = [], opt = {}) {
         repairUpDurations(merged);
         store.items.unshift(...its); added = its.length;
       } else {
-        const vlist = await fetchUpVideos(sub.mid, 50);
+        const vlist = (await fetchUpVideos(sub.mid, 50)).slice(0, 5);   /* 无关键词只收最新 5 条 */
         const its = itemsFromUpVideos(vlist, sub.id, sub.kws || [], sub.exkws || [], ks);
         repairUpDurations(vlist);
         store.items.unshift(...its); added = its.length;
@@ -1139,10 +1155,10 @@ function delSub(id) {
   save(); rebuildDedupe();
   updateAllUI('subs', 'todo');
 }
-/* 编辑订阅筛选规则。
+/* 编辑订阅: 分类标签 + 匹配/排除关键词。
  * UP 订阅要额外做一次去重: 改后的关键词组合若与该 UP 的另一条订阅撞车,
  * 会导致两条订阅筛选完全相同 —— 拒绝并保持原值, 由返回值告知调用方。 */
-function editSub(id, kwRaw, exRaw) {
+function editSub(id, kwRaw, exRaw, cat) {
   const s = store.subs.find(x => x.id === id); if (!s) return { ok: true };
   const kws = kwRaw ? kwRaw.split(/[,，\s]+/).filter(Boolean).map(x => x.trim()).slice(0, 20) : [];
   const exkws = exRaw ? exRaw.split(/[,，\s]+/).filter(Boolean).map(x => x.trim()).slice(0, 20) : [];
@@ -1153,6 +1169,7 @@ function editSub(id, kwRaw, exRaw) {
   }
   s.kws = kws;
   s.exkws = exkws;
+  if (SUB_CATS.some(x => x[0] === cat)) s.cat = cat;
   save(); updateAllUI('subs', 'todo');
   return { ok: true };
 }
@@ -2237,8 +2254,6 @@ const ICO = {
   film: _bi('<path d="M0 1a1 1 0 0 1 1-1h14a1 1 0 0 1 1 1v14a1 1 0 0 1-1 1H1a1 1 0 0 1-1-1zm4 0v6h8V1zm8 8v6h1V9zM1 9h3v6H1zM1 1v6h3V1zm11 0v6h3V1zM4 9v6h8V9z"/>'),
   /* 下载 */
   download: _bi('<path d="M.5 9.9a.5.5 0 0 1 .5.5v2.5a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-2.5a.5.5 0 0 1 1 0v2.5a2 2 0 0 1-2 2H2a2 2 0 0 1-2-2v-2.5a.5.5 0 0 1 .5-.5"/><path d="M7.646 11.854a.5.5 0 0 0 .708 0l3-3a.5.5 0 0 0-.708-.708L8.5 10.293V1.5a.5.5 0 0 0-1 0v8.793L5.354 8.146a.5.5 0 1 0-.708.708z"/>'),
-  /* 电源 */
-  power: _bi('<path d="M7.5 1v7h1V1z"/><path d="M3 8.812a5 5 0 0 1 2.578-4.375l-.485-.874A6 6 0 1 0 11 3.616l-.501.865A5 5 0 1 1 3 8.812"/>'),
   /* 编辑 */
   edit: _bi('<path d="M12.146.146a.5.5 0 0 1 .708 0l3 3a.5.5 0 0 1 0 .708l-10 10a.5.5 0 0 1-.168.11l-5 2a.5.5 0 0 1-.65-.65l2-5a.5.5 0 0 1 .11-.168zM11.207 2.5 13.5 4.793 14.793 3.5 12.5 1.207zm1.586 3L10.5 3.207 4 9.707V10h.5a.5.5 0 0 1 .5.5v.5h.5a.5.5 0 0 1 .5.5v.5h.293zm-9.761 5.175-.106.106-1.528 3.821 3.821-1.528.106-.106A.5.5 0 0 1 5 12.5V12h-.5a.5.5 0 0 1-.5-.5V11h-.5a.5.5 0 0 1-.468-.325"/>'),
   /* 外链 */
@@ -2261,8 +2276,6 @@ const ICO = {
   clock: _bi('<path d="M8 3.5a.5.5 0 0 0-1 0V9a.5.5 0 0 0 .252.434l3.5 2a.5.5 0 0 0 .496-.868L8 8.71z"/><path d="M8 16A8 8 0 1 0 8 0a8 8 0 0 0 0 16m7-8A7 7 0 1 1 1 8a7 7 0 0 1 14 0"/>'),
   /* 星标 */
   star: _bi('<path d="M2.866 14.85c-.078.444.36.791.746.593l4.39-2.256 4.389 2.256c.386.198.824-.149.746-.592l-.83-4.73 3.522-3.356c.33-.314.16-.888-.282-.95l-4.898-.696L8.465.792a.513.513 0 0 0-.927 0L5.354 5.12l-4.898.696c-.441.062-.612.636-.283.95l3.523 3.356z"/>'),
-  /* 闪电（性能） */
-  zap: _bi('<path d="M11.251.068a.5.5 0 0 1 .227.58L9.677 6.5H13a.5.5 0 0 1 .364.843l-8 8.5a.5.5 0 0 1-.842-.49L6.323 9.5H3a.5.5 0 0 1-.364-.843l8-8.5a.5.5 0 0 1 .615-.09z"/>'),
   /* 加号 */
   plus: _bi('<path d="M8 2a.5.5 0 0 1 .5.5v5h5a.5.5 0 0 1 0 1h-5v5a.5.5 0 0 1-1 0v-5h-5a.5.5 0 0 1 0-1h5v-5A.5.5 0 0 1 8 2"/>'),
   /* 合集 / 专辑（播放列表） */
@@ -2428,9 +2441,12 @@ const TL = {
       '<div class="mb">' + (cfg.html || '') +
         fields.map(f => '<div class="fld"><div class="fl">' + esc(f.label || '') +
           (f.hint ? '<span class="hint">' + esc(f.hint) + '</span>' : '') + '</div>' +
-          (f.multiline
-            ? '<textarea rows="' + (f.rows || 2) + '" id="tl-' + f.id + '" placeholder="' + attr(f.placeholder || '') + '">' + esc(f.value || '') + '</textarea>'
-            : '<input type="text" id="tl-' + f.id + '" value="' + attr(f.value || '') + '" placeholder="' + attr(f.placeholder || '') + '">') +
+          (f.options
+            ? '<select class="sel" id="tl-' + f.id + '">' + f.options.map(o =>
+                '<option value="' + attr(o.v) + '"' + (String(f.value == null ? '' : f.value) === String(o.v) ? ' selected' : '') + '>' + esc(o.t) + '</option>').join('') + '</select>'
+            : f.multiline
+              ? '<textarea rows="' + (f.rows || 2) + '" id="tl-' + f.id + '" placeholder="' + attr(f.placeholder || '') + '">' + esc(f.value || '') + '</textarea>'
+              : '<input type="text" id="tl-' + f.id + '" value="' + attr(f.value || '') + '" placeholder="' + attr(f.placeholder || '') + '">') +
           (f.note ? '<div class="desc">' + f.note + '</div>' : '') + '</div>').join('') +
       '</div>' +
       '<div class="mf">' +
@@ -2573,7 +2589,6 @@ button{font-family:inherit}
 .icobtn:hover{background:var(--hover);color:var(--t1)}
 .icobtn:active{transform:scale(.92)}
 .icobtn svg{width:18px;height:18px;display:block}
-.icobtn.on{color:var(--ok)}.icobtn.off{color:var(--t4)}
 .icobtn.danger:hover{background:rgba(230,69,82,.12);color:var(--err)}
 .icobtn.busy svg{animation:brs-spin .85s linear infinite}
 @keyframes brs-spin{to{transform:rotate(360deg)}}
@@ -2624,6 +2639,11 @@ button{font-family:inherit}
 .sbox.has .clr{display:flex}
 .sbox .clr:hover{background:var(--hover);color:var(--t1)}
 .sbox .clr svg{width:13px;height:13px;display:block}
+/* 稍后再看工具条: 状态分类 + 搜索栏 + 订阅标签筛选 强制同一行, 不再换行错位 */
+#pg-todo .bar{flex-wrap:nowrap}
+#pg-todo .seg{flex:0 1 auto;min-width:0}
+#pg-todo .sbox{min-width:96px;flex:1 1 auto;max-width:none}
+#pg-todo #brsFltSub{flex:0 1 auto;width:auto;max-width:158px}
 
 /* ---------- 滚动区 ---------- */
 .d-body{flex:1;overflow-y:auto;overflow-x:hidden;padding:12px 14px 22px;background:var(--panel);overscroll-behavior:contain}
@@ -2759,7 +2779,6 @@ button{font-family:inherit}
 .subrow{display:flex;align-items:center;gap:11px;padding:11px;border:1px solid var(--line);border-radius:13px;
   margin-bottom:8px;background:var(--panel);content-visibility:auto;contain-intrinsic-size:auto 84px;transition:.15s}
 .subrow:hover{border-color:rgba(251,114,153,.38);box-shadow:var(--shadow-md)}
-.subrow.off{opacity:.68}
 .subrow .ic{width:40px;height:40px;border-radius:13px;font-size:15px;font-weight:800}
 .submid{flex:1;min-width:0;display:flex;flex-direction:column;gap:3px}
 .subname{font-size:13.3px;font-weight:700;display:flex;align-items:center;gap:7px;min-width:0}
@@ -2770,6 +2789,7 @@ button{font-family:inherit}
 .stype.ugc{background:rgba(240,160,32,.14);color:#c8791a;border-color:rgba(240,160,32,.3)}
 .stype.season{background:rgba(138,92,246,.13);color:#7c5cd6;border-color:rgba(138,92,246,.28)}
 .stype.bangumi{background:rgba(251,114,153,.14);color:var(--brand-2);border-color:rgba(251,114,153,.32)}
+.stype.album{background:rgba(138,92,246,.13);color:#7c5cd6;border-color:rgba(138,92,246,.28)}
 .subsub{font-size:11px;color:var(--t3);display:flex;gap:9px;flex-wrap:wrap;font-variant-numeric:tabular-nums;align-items:center}
 .subsub .sep{width:1px;height:9px;background:var(--line-2)}
 .subflt{font-size:10.5px;color:var(--t2);display:flex;gap:5px;flex-wrap:wrap;margin-top:1px}
@@ -2940,6 +2960,7 @@ button{font-family:inherit}
 .modal .mb input[type=text],.modal .mb textarea{width:100%;border:1px solid var(--line-2);border-radius:10px;padding:8px 11px;
   background:var(--panel-2);font-size:12.8px;color:var(--t1);outline:none;font-family:inherit;resize:vertical;transition:.14s}
 .modal .mb input[type=text]{height:36px}
+.modal .mb select.sel{width:100%;max-width:none;height:36px}
 .modal .mb input:focus,.modal .mb textarea:focus{border-color:var(--brand);background:var(--panel);
   box-shadow:0 0 0 3px rgba(251,114,153,.15)}
 .modal .mb input.bad,.modal .mb textarea.bad{border-color:var(--err);box-shadow:0 0 0 3px rgba(230,69,82,.15)}
@@ -2957,6 +2978,11 @@ button{font-family:inherit}
   .rail .d-tab{padding:7px 2px 6px;font-size:9.5px}
   .rail .d-tab .i-wrap{width:33px;height:26px}
   .rail .d-tab svg{width:18px;height:18px}
+}
+/* 窄窗口下抽屉被压缩到放不下「状态 + 搜索 + 筛选」一行 → 退回换行(宁可错位也不挤压) */
+@media (max-width:720px){
+  #pg-todo .bar{flex-wrap:wrap}
+  #pg-todo .sbox{flex:1 1 100%;min-width:132px}
 }
 @media (prefers-reduced-motion:reduce){
   *{animation:none!important;transition:none!important}
@@ -2999,7 +3025,6 @@ const HTML = `
               <button data-seg="ignored">已忽略 <span class="n" id="brsSegIgnN">0</span></button>
               <button data-seg="total">全部 <span class="n" id="brsSegAllN">0</span></button>
             </div>
-            <span class="grow"></span>
             <div class="sbox" id="brsSearchBox">${ICO.search}<input type="text" id="brsSearch" placeholder="搜索标题 / UP…" autocomplete="off"><button class="clr" id="brsSearchClr" title="清空">${ICO.close}</button></div>
             <div id="brsFltRow" style="display:contents"></div>
           </div>
@@ -3021,7 +3046,7 @@ const HTML = `
         <div id="pg-subs" class="pg">
           <div class="bar">
             <div class="seg" id="brsSegSubs">
-              <button data-seg="all" class="on">全部</button><button data-seg="up">UP 投稿</button><button data-seg="season">合集</button><button data-seg="ugc">分P视频</button><button data-seg="bangumi">番剧</button><button data-seg="off">已停用</button>
+              <button data-seg="all" class="on">全部</button><button data-seg="up">UP 投稿</button><button data-seg="bangumi">番剧</button><button data-seg="album">专辑</button>
             </div>
             <span class="grow"></span>
             <span class="dl-sum" id="brsSubsSum"></span>
@@ -3066,7 +3091,7 @@ const HTML = `
             <div style="flex:1;min-width:0">
               <div class="an">BilibiliRSS <span class="ver">v${DEFAULTS.ver}</span></div>
               <div class="av">作者 xinbaji · 数据仅存本地 · 前端 v3</div>
-              <div class="al"><a class="sbtn sm" style="text-decoration:none" href="${REPO_URL}" target="_blank" rel="noopener">${ICO.external}GitHub</a><a class="sbtn sm pink" style="text-decoration:none" id="brsBtnUpdate" href="${UPD_URL}" target="_blank" rel="noopener" title="打开最新版脚本地址（远端 latest Release，经 ghproxy.net 镜像）">${ICO.refresh}更新</a><span class="chip p">${ICO.zap}高性能渲染</span></div>
+              <div class="al"><a class="sbtn sm" style="text-decoration:none" href="${REPO_URL}" target="_blank" rel="noopener">${ICO.external}GitHub</a><a class="sbtn sm pink" style="text-decoration:none" id="brsBtnUpdate" href="${UPD_URL}" target="_blank" rel="noopener" title="打开最新版脚本地址（远端 latest Release，经 ghproxy.net 镜像）">${ICO.refresh}更新</a></div>
             </div>
           </div>
           <div style="height:8px"></div>
@@ -3118,6 +3143,9 @@ function mountUI() {
   curTheme = readTheme();
   applyTheme(curTheme);
   bindUI();
+  /* 首次挂载就把「订阅筛选」下拉建出来（renderChips 不在 view 渲染表里，
+   * 只在 updateAllUI 里标脏不会渲染 → 否则要等用户点一次状态分类才出现） */
+  renderChips();
   updateAllUI();
 }
 const q = sel => shadowRoot ? shadowRoot.querySelector(sel) : null;
@@ -3379,7 +3407,7 @@ const TAB_HINT = {
   todo: '稍后再看 · 状态与订阅筛选',
   bench: '工作台 · 一键订阅 / 监控 / 下载当前页面',
   mon: '增量监控 · 粉丝 / 播放 / 互动数据',
-  subs: '订阅管理 · UP / 合集 / 分P视频',
+  subs: '订阅管理 · UP / 番剧 / 专辑',
   dl: '下载管理 · 任务队列与进度',
   set: '设置 · 通知 / 下载 / 数据'
 };
@@ -3396,7 +3424,7 @@ function switchTab(tab) {
   });
   const body = q('#brsBody'); if (body) body.scrollTop = 0;
   const sub = q('#brsHeadSub'); if (sub) sub.textContent = TAB_HINT[tab] || '';
-  if (tab === 'todo') renderTodo();
+  if (tab === 'todo') { renderChips(); renderTodo(); }
   else if (tab === 'mon') renderMon();
   else if (tab === 'subs') renderSubs();
   else if (tab === 'bench') renderDlPick();
@@ -3405,7 +3433,7 @@ function switchTab(tab) {
 }
 /* 强制立即渲染当前视图（用于导入/清空等结构级变更） */
 function renderAllNow() {
-  if (V.tab === 'todo') renderTodo();
+  if (V.tab === 'todo') { renderChips(); renderTodo(); }
   else if (V.tab === 'mon') renderMon();
   else if (V.tab === 'subs') renderSubs();
   else if (V.tab === 'bench') renderDlPick();
@@ -3475,7 +3503,9 @@ function openTodoItem(id) {
 const metaOf = i => store.subs.find(x => x.id === i.subId);
 const shortName = (n, len = 12) => { const s = String(n || ''); return s.length > len ? s.slice(0, len) + '…' : s; };
 
-/* 订阅维度下拉（保留后端契约 #brsFltRow / #brsFltSub） */
+/* 订阅维度下拉（保留后端契约 #brsFltRow / #brsFltSub）
+ * 选项文案用订阅的「第一个匹配关键词」当标签（无关键词的订阅回落到 UP 名），
+ * 完整名称/全部关键词放在 title 里。 */
 function renderChips() {
   const st = store.ui.curStatus;
   if (!['todo', 'done', 'ignored', 'total'].includes(st)) store.ui.curStatus = 'todo';
@@ -3485,12 +3515,22 @@ function renderChips() {
   const cs = store.ui.curSub;
   const row = q('#brsFltRow');
   if (!row) return;
-  const sig = cs + '||' + subs.map(s => s.id + s.name).join(',');
+  /* 标签 = 第一个关键词（无则 UP 名） */
+  const label = s => {
+    const kw = (Array.isArray(s.kws) ? s.kws : []).find(k => String(k || '').trim());
+    return kw ? String(kw).trim() : String(s.name || '');
+  };
+  const title = s => {
+    const kws = (Array.isArray(s.kws) ? s.kws : []).filter(Boolean);
+    const exs = (Array.isArray(s.exkws) ? s.exkws : []).filter(Boolean);
+    return String(s.name || '') + (kws.length ? ' · 含 ' + kws.join('、') : '') + (exs.length ? ' · 排除 ' + exs.join('、') : '');
+  };
+  const sig = cs + '||' + subs.map(s => s.id + label(s)).join(',');
   if (row.__sig !== sig) {
     row.__sig = sig;
-    row.innerHTML = '<select class="sel" id="brsFltSub" title="按订阅筛选">' +
+    row.innerHTML = '<select class="sel" id="brsFltSub" title="按订阅标签筛选">' +
       '<option value=""' + (cs === '' ? ' selected' : '') + '>全部订阅</option>' +
-      subs.map(s => '<option value="' + attr(s.id) + '"' + (cs === s.id ? ' selected' : '') + ' title="' + attr(s.name) + '">' + esc(shortName(s.name, 14)) + '</option>').join('') +
+      subs.map(s => '<option value="' + attr(s.id) + '"' + (cs === s.id ? ' selected' : '') + ' title="' + attr(title(s)) + '">' + esc(shortName(label(s), 14)) + '</option>').join('') +
       '</select>';
     const el = q('#brsFltSub');
     if (el) el.addEventListener('change', () => { store.ui.curSub = el.value; save(); V.limit.todo = 60; markDirty('todo'); });
@@ -3547,7 +3587,7 @@ function renderTodo() {
           '<button class="act b-restore" data-act="restore" title="还原为稍后再看" style="display:none">' + ICO.undo + '</button>' +
           '<button class="act b-dl" data-act="dl" title="下载视频">' + ICO.download + '</button>' +
           '<button class="act watch b-open" data-act="open" title="在 B 站打开">' + ICO.external + '</button>' +
-          '<button class="act del b-del" data-act="del" title="删除（永不再入）">' + ICO.trash + '</button>' +
+          '<button class="act del b-del" data-act="del" title="删除">' + ICO.trash + '</button>' +
         '</div>' +
       '</div>';
     return d;
@@ -3601,7 +3641,10 @@ function renderTodo() {
     const au = it.author || '未知 UP';
     if (nm.textContent !== au) { nm.textContent = au; nm.title = au; }
     const tm = $('.tm');
-    const pub = it.pub || '';
+    /* 发布时间按「入库时保存的时间戳 ts」实时换算, 每次重绘都会刷新 ——
+     * 直接用存下来的 pub 字符串会永远停在入库那一刻(「1 小时前」不会变成「2 天前」)。
+     * 超过一个月的条目 fmtDate 自动回落为「YYYY-MM-DD」。 */
+    const pub = it.ts ? fmtDate(it.ts) : (it.pub || '');
     if (tm.textContent !== pub) tm.textContent = pub;
 
     $('.st-ok').style.display = isDone ? '' : 'none';
@@ -3826,8 +3869,7 @@ function renderSubs() {
   if (!el) return;
   const seg = V.seg.subs || 'all';
   let ss = (store.subs || []).slice();
-  if (seg === 'off') ss = ss.filter(s => !s.on);
-  else if (seg !== 'all') ss = ss.filter(s => (s.type || 'up') === seg);
+  if (seg !== 'all') ss = ss.filter(s => catOf(s) === seg);
   flushCounts();
   const sum = q('#brsSubsSum');
   if (sum) sum.textContent = '共 ' + (store.subs || []).length + ' 个订阅';
@@ -3844,9 +3886,6 @@ function renderSubs() {
     return;
   }
   if (el.__sig) { el.__sig = ''; el.innerHTML = ''; }
-  const typeName = t => t === 'season' ? '合集'
-    : (t === 'up' ? 'UP 投稿' : (t === 'bangumi' ? '番剧' : '分P视频'));
-  const typeLabel = s => (s.type === 'season' && s.isSeries) ? '专辑' : typeName(s.type);
 
   patchList(el, ss, s => s.id, () => {
     const d = document.createElement('div');
@@ -3854,22 +3893,21 @@ function renderSubs() {
     d.innerHTML =
       '<span class="ic ava"></span>' +
       '<div class="submid">' +
-        '<div class="subname"><span class="nm"></span><span class="stype"></span><span class="chip ig multi-tag" style="display:none"></span><span class="chip ig off-tag" style="display:none">已停用</span></div>' +
+        '<div class="subname"><span class="nm"></span><span class="stype"></span><span class="chip ig multi-tag" style="display:none"></span></div>' +
         '<div class="subsub"><span class="src"></span><span class="sep"></span><span class="cnt"></span><span class="sep"></span><span class="added"></span></div>' +
         '<div class="subflt" style="display:none"></div>' +
       '</div>' +
       '<div class="subacts">' +
         '<button class="act rf" data-act="refresh" title="刷新该订阅（全历史匹配）">' + ICO.refresh + '</button>' +
-        '<button class="act" data-act="edit" title="编辑筛选关键词">' + ICO.edit + '</button>' +
-        '<button class="act" data-act="toggle" title="启用 / 停用">' + ICO.power + '</button>' +
+        '<button class="act" data-act="edit" title="编辑分类 / 筛选关键词">' + ICO.edit + '</button>' +
         '<button class="act del" data-act="del" title="删除订阅">' + ICO.trash + '</button>' +
       '</div>';
     return d;
   }, (node, s) => {
     const $ = x => node.querySelector(x);
     if (node.dataset.sid !== s.id) node.dataset.sid = s.id;
-    node.classList.toggle('off', !s.on);
     const t = s.type || 'up';
+    const cat = catOf(s);
 
     const ava = $('.ic');
     if (ava.dataset.ava !== (s.face || '')) {
@@ -3882,7 +3920,7 @@ function renderSubs() {
     const label = s.name || '(未命名)';
     if (nm.textContent !== label) { nm.textContent = label; nm.title = label; }
     const st = $('.stype');
-    if (st.__t !== t) { st.__t = t; st.className = 'stype ' + t; st.textContent = typeLabel(s); }
+    if (st.__t !== cat) { st.__t = cat; st.className = 'stype ' + cat; st.textContent = catLabel(cat); }
     /* 同一个 UP 可能有多条订阅(各自不同关键词) → 用「第 n/m 条」小标记区分, 否则
      * 列表里会出现两行完全同名的 UP 卡片, 用户无从分辨。 */
     const multi = $('.multi-tag');
@@ -3894,9 +3932,6 @@ function renderSubs() {
       multi.textContent = mTxt;
       multi.style.display = mTxt ? '' : 'none';
     }
-    const offTag = $('.off-tag');
-    const showOff = !s.on;
-    if ((offTag.style.display !== 'none') !== showOff) offTag.style.display = showOff ? '' : 'none';
 
     const cnt = (store.items || []).filter(i => i.subId === s.id && i.st !== 'done').length;
     const cntEl = $('.cnt');
@@ -3919,14 +3954,6 @@ function renderSubs() {
       fltEl.__h = fh; fltEl.innerHTML = fh;
       fltEl.style.display = fh ? '' : 'none';
     }
-    const pw = node.querySelector('[data-act="toggle"]');
-    if (pw) {
-      const on = !!s.on;
-      if (pw.classList.contains('on') !== on) pw.classList.toggle('on', on);
-      if (pw.classList.contains('off') !== !on) pw.classList.toggle('off', !on);
-      const pwTitle = on ? '停用该订阅' : '启用该订阅';
-      if (pw.title !== pwTitle) pw.title = pwTitle;
-    }
   });
 
   warmAvatars(el);
@@ -3939,12 +3966,6 @@ async function onSubsClick(ev) {
   const s = store.subs.find(x => x.id === sid); if (!s) return;
   const act = b.dataset.act;
 
-  if (act === 'toggle') {
-    s.on = !s.on; save();
-    renderSubs(); flushCounts();
-    toast(s.on ? '已启用订阅' : '已停用订阅');
-    return;
-  }
   if (act === 'del') {
     const cnt = (store.items || []).filter(i => i.subId === sid && i.st !== 'done').length;
     const ok = await TL.confirm({
@@ -3957,25 +3978,40 @@ async function onSubsClick(ev) {
   if (act === 'edit') {
     const cur = { kws: (s.kws || []).filter(Boolean), exkws: (s.exkws || []).filter(Boolean) };
     const r = await TL.show({
-      title: '编辑筛选规则', icon: ICO.edit, desc: esc(clampTxt(s.name, 40)),
+      title: '编辑订阅', icon: ICO.edit, desc: esc(clampTxt(s.name, 40)),
       fields: [
+        { id: 'cat', label: '分类', hint: '决定归到上方哪个分类',
+          value: catOf(s), options: SUB_CATS.map(([v, t]) => ({ v, t })),
+          note: '仅作分类标签，不影响抓取方式；上方分类切换按它过滤' },
         { id: 'kws', label: '匹配关键词', hint: '逗号 / 空格分隔', value: cur.kws.join('、'),
-          placeholder: '留空 = 收录全部投稿', note: '标题需<b>同时包含全部</b>关键词的投稿才会收（AND 逻辑）' },
+          placeholder: '留空 = 收录全部投稿', note: '标题需<b>同时包含全部</b>关键词的投稿才会收（AND 逻辑）；留空时只收该 UP 最新 5 条' },
         { id: 'exkws', label: '排除关键词', hint: '逗号 / 空格分隔', value: cur.exkws.join('、'),
           placeholder: '留空 = 不排除任何投稿', note: '标题含其中<b>任一</b>词的投稿会被跳过' }
       ],
       okText: '保存'
     });
     if (!r) return;
-    const er = editSub(sid, r.fields.kws.trim(), r.fields.exkws.trim());
+    const before = (s.kws || []).join('|') + '#' + (s.exkws || []).join('|');
+    const er = editSub(sid, r.fields.kws.trim(), r.fields.exkws.trim(), r.fields.cat);
     if (er && !er.ok) { toast(er.msg || '保存失败'); return; }
     renderSubs(); renderChips();
-    const nk = (store.subs.find(x => x.id === sid) || {}).kws || [];
-    toast(nk.length ? ('筛选已更新，需同时包含：' + nk.join('、')) : '筛选已更新，将收录全部投稿');
+    const after = (s.kws || []).join('|') + '#' + (s.exkws || []).join('|');
+    const nk = s.kws || [];
+    /* 关键词变了必须按新规则「全历史重扫」一遍 —— 日常刷新只看最新一页,
+     * 改完关键词后老投稿里的匹配项根本不会被扫到(表现为「只刷新出一条」)。 */
+    if (before !== after) {
+      toast('筛选已更新，正在按新规则全历史重扫…');
+      try {
+        const { added } = await refreshSub(s, { full: true });
+        save(); updateAllUI(); renderSubs(); renderChips();
+        toast(added ? ('筛选已更新，新增 ' + added + ' 条') : '筛选已更新，没有新的匹配投稿');
+      } catch (e) { toast('筛选已更新，重扫失败：' + errMsg(e)); }
+      return;
+    }
+    toast(nk.length ? ('已保存，需同时包含：' + nk.join('、')) : '已保存，无关键词只收最新 5 条');
     return;
   }
   if (act === 'refresh') {
-    if (!s.on) { toast('该订阅已停用，请先点电源图标启用'); return; }
     if (b.classList.contains('busy')) return;
     b.classList.add('busy');
     toast('正在刷新「' + clampTxt(s.name, 20) + '」…');
@@ -4462,9 +4498,9 @@ function askSubKwInline(upName, defKw = '', exist = [], anchor = null) {
     ? '<div class="dlpk-ex"><div>该 UP 已有 ' + exist.length + ' 条订阅，填一组<b>不同</b>的关键词即可再订阅一次：</div><ul>'
       + exist.map(s => {
           const kw = (s.kws || []).filter(Boolean), ex = (s.exkws || []).filter(Boolean);
-          let t = kw.length ? kw.join('+') : '全部投稿';
+          let t = kw.length ? kw.join('+') : '无关键词（只收最新 5 条）';
           if (ex.length) t += '（排除 ' + ex.join('/') + '）';
-          return '<li>' + esc(t) + (s.on ? '' : ' <span class="off">· 已停用</span>') + '</li>';
+          return '<li>' + esc(t) + '</li>';
         }).join('')
       + '</ul></div>'
     : '';
@@ -4475,9 +4511,9 @@ function askSubKwInline(upName, defKw = '', exist = [], anchor = null) {
   card.innerHTML =
     '<div class="dlp-title"><span class="hb">' + ICO.search + '订阅「' + esc(upName) + '」</span>' +
       '<span class="rt" style="margin-left:auto;font-size:11px;color:var(--t3)">设置筛选关键词（可选）</span></div>' +
-    '<div class="fld"><div class="fl">匹配关键词<span class="hint">AND · 留空 = 全收</span></div>' +
+    '<div class="fld"><div class="fl">匹配关键词<span class="hint">AND · 留空 = 只收最新 5 条</span></div>' +
       '<input type="text" id="brsKwMain" placeholder="逗号或空格分隔" value="' + attr(defKw || '') + '">' +
-      '<div class="desc">标题需<b>同时包含全部</b>关键词才会收进稍后再看</div></div>' +
+      '<div class="desc">标题需<b>同时包含全部</b>关键词才会收进稍后再看；<b>留空</b>则只收该 UP 最新 5 条，不倒灌历史投稿</div></div>' +
     '<div class="fld"><div class="fl">排除关键词<span class="hint">命中任一即跳过</span></div>' +
       '<input type="text" id="brsKwEx" placeholder="留空 = 不排除"></div>' +
     existHtml +
@@ -4626,7 +4662,6 @@ async function subscribeUp(mid, upName, opt = {}) {
   const sig = subSig('up', mid, kw.kws, kw.exkws);
   const same = exist.find(s => subSig('up', s.mid, s.kws, s.exkws) === sig);
   if (same) {
-    if (!same.on) { toast('该关键词组合的订阅已停用，请到订阅页点电源图标启用'); return true; }
     toast('该关键词组合已在订阅，后台刷新中…');
     bgFinishSub(same);
     return true;
@@ -4653,7 +4688,6 @@ async function subscribeSeasonNow() {
   const kn = p.isSeries ? '专辑' : '合集';
   const existing = store.subs.find(s => s.type === 'season' && String(s.sid) === String(p.sid) && String(s.mid) === String(p.mid));
   if (existing) {
-    if (!existing.on) { toast('该' + kn + '订阅已停用，请到订阅页点电源图标启用'); return; }
     toast('该' + kn + '已在订阅，后台刷新中…');
     bgFinishSub(existing);
     return;
@@ -4676,7 +4710,6 @@ async function subscribeSeasonById(mid, sid, isSeries) {
   const kn = isSeries ? '专辑' : '合集';
   const existing = store.subs.find(s => s.type === 'season' && String(s.sid) === String(sid) && String(s.mid) === String(mid));
   if (existing) {
-    if (!existing.on) { toast('该' + kn + '订阅已停用，请到订阅页点电源图标启用'); return; }
     toast('该' + kn + '已在订阅，后台刷新中…');
     bgFinishSub(existing);
     return;
@@ -4738,7 +4771,6 @@ async function subscribeBangumiNow(link) {
   const existing = store.subs.find(s => s.type === 'bangumi' &&
     (p.ssid ? String(s.ssid) === String(p.ssid) : false));
   if (existing) {
-    if (!existing.on) { toast('该番剧订阅已停用，请到订阅页点电源图标启用'); return; }
     toast('该番剧已在订阅，后台刷新中…');
     bgFinishSub(existing);
     return;
