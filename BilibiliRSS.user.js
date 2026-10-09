@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BilibiliRSS
 // @namespace    https://github.com/xinbaji/BilibiliRSS
-// @version      0.4.2
+// @version      0.4.3
 // @description  B站稍后再看 · UP/合集/视频订阅追更 · 增量监控 · 下载(直链+DASH ffmpeg合并mp4)+弹幕XML（独立油猴版）
 // @author       xinbaji
 // @updateURL    https://ghproxy.net/https://github.com/xinbaji/BilibiliRSS/releases/latest/download/BilibiliRSS.user.js
@@ -156,7 +156,7 @@ function md5(str) {
  *           计数角标由 flushCounts() 每帧无条件刷新, 与标脏范围无关。 */
 const NS = 'BilibiliRSS';
 const DEFAULTS = {
-  ver: '0.4.2',
+  ver: '0.4.3',
   settings: {
     notify: true, dlQn: 127, dlDanmu: true,
     /* v0.3.1 下载形态开关 */
@@ -2639,11 +2639,14 @@ button{font-family:inherit}
 .sbox.has .clr{display:flex}
 .sbox .clr:hover{background:var(--hover);color:var(--t1)}
 .sbox .clr svg{width:13px;height:13px;display:block}
-/* 稍后再看工具条: 状态分类 + 搜索栏 + 订阅标签筛选 强制同一行, 不再换行错位 */
-#pg-todo .bar{flex-wrap:nowrap}
-#pg-todo .seg{flex:0 1 auto;min-width:0}
-#pg-todo .sbox{min-width:96px;flex:1 1 auto;max-width:none}
+/* 稍后再看工具条: 状态分类 + 订阅标签筛选 同行; 搜索收进按钮,
+ * 点开后在工具条下面独占一行(不再挤掉左侧的「全部」) */
 #pg-todo #brsFltSub{flex:0 1 auto;width:auto;max-width:158px}
+#brsSearchRow{flex:1 1 100%;display:none;padding-top:8px}
+#brsSearchRow.show{display:block}
+#brsSearchRow .sbox{max-width:none;width:100%;min-width:0;flex:none}
+#brsSearchBtn{flex:none}
+#brsSearchBtn.on{background:var(--brand-soft);color:var(--brand-2)}
 
 /* ---------- 滚动区 ---------- */
 .d-body{flex:1;overflow-y:auto;overflow-x:hidden;padding:12px 14px 22px;background:var(--panel);overscroll-behavior:contain}
@@ -2979,11 +2982,6 @@ button{font-family:inherit}
   .rail .d-tab .i-wrap{width:33px;height:26px}
   .rail .d-tab svg{width:18px;height:18px}
 }
-/* 窄窗口下抽屉被压缩到放不下「状态 + 搜索 + 筛选」一行 → 退回换行(宁可错位也不挤压) */
-@media (max-width:720px){
-  #pg-todo .bar{flex-wrap:wrap}
-  #pg-todo .sbox{flex:1 1 100%;min-width:132px}
-}
 @media (prefers-reduced-motion:reduce){
   *{animation:none!important;transition:none!important}
 }
@@ -3025,8 +3023,12 @@ const HTML = `
               <button data-seg="ignored">已忽略 <span class="n" id="brsSegIgnN">0</span></button>
               <button data-seg="total">全部 <span class="n" id="brsSegAllN">0</span></button>
             </div>
-            <div class="sbox" id="brsSearchBox">${ICO.search}<input type="text" id="brsSearch" placeholder="搜索标题 / UP…" autocomplete="off"><button class="clr" id="brsSearchClr" title="清空">${ICO.close}</button></div>
+            <span class="grow"></span>
             <div id="brsFltRow" style="display:contents"></div>
+            <button class="icobtn" id="brsSearchBtn" title="搜索标题 / UP">${ICO.search}</button>
+            <div id="brsSearchRow">
+              <div class="sbox" id="brsSearchBox">${ICO.search}<input type="text" id="brsSearch" placeholder="搜索标题 / UP…" autocomplete="off"><button class="clr" id="brsSearchClr" title="清空">${ICO.close}</button></div>
+            </div>
           </div>
           <div id="brsTodoList"></div>
         </div>
@@ -3226,6 +3228,23 @@ function bindUI() {
   /* 搜索（120ms 防抖） */
   bindSearch('#brsSearch', '#brsSearchBox', '#brsSearchClr', v => { V.search = v; V.limit.todo = 60; markDirty('todo'); });
   bindSearch('#brsMonSearch', '#brsMonSearchBox', '#brsMonSearchClr', v => { V.monSearch = v; markDirty('mon'); });
+  /* 搜索框默认收起, 只留一个放大镜按钮:
+   * 点开 → 工具条下方展开一整行输入框; 再点 → 收回。
+   * 收回时把关键词一并清掉 —— 否则会留下一个「看不见但还在生效」的筛选。 */
+  const sBtn = q('#brsSearchBtn'), sRow = q('#brsSearchRow');
+  if (sBtn && sRow) sBtn.addEventListener('click', () => {
+    const open = !sRow.classList.contains('show');
+    sRow.classList.toggle('show', open);
+    sBtn.classList.toggle('on', open);
+    if (open) {
+      setTimeout(() => { const si = q('#brsSearch'); if (si) si.focus(); }, 30);
+    } else if (V.search) {
+      V.search = ''; V.limit.todo = 60;
+      const si = q('#brsSearch'); if (si) si.value = '';
+      const sb = q('#brsSearchBox'); if (sb) sb.classList.remove('has');
+      markDirty('todo');
+    }
+  });
   /* 下载页头部：点击滚回顶部（下载已独立成页，不再折叠） */
   const dlHead = q('#brsDlHead');
   if (dlHead) dlHead.addEventListener('click', () => { const b = q('#brsBody'); if (b) b.scrollTop = 0; });
